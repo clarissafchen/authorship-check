@@ -6,7 +6,7 @@ def scrape_expert_directory(url="https://www.mlforseo.com/experts/"):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, timeout=60000)
-        page.wait_for_selector("article.expert-card", timeout=1000000)  # Wait for JS to render
+        page.wait_for_selector("article.expert-card", timeout=100000000)  # Wait for JS to render
         content = page.content()
         browser.close()
 
