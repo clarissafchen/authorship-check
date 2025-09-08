@@ -1,4 +1,6 @@
 import streamlit as st
+import os
+os.system("playwright install chromium")
 from directory_scraper import scrape_expert_directory
 from authorship_check import check_authorship
 import pandas as pd
