@@ -7,7 +7,12 @@ def extract_author_info(url):
         res = requests.get(url, timeout=10)
         res.raise_for_status()
     except Exception as e:
-        return {"url": url, "error": str(e), "match": False}
+        return {
+            "url": url,
+            "author": None,
+            "match": False,
+            "reason": f"Failed to fetch: {e}"
+        }
 
     soup = BeautifulSoup(res.text, 'html.parser')
 
@@ -25,7 +30,10 @@ def extract_author_info(url):
         byline.get_text(strip=True) if byline else None
     )
 
-    return {"url": url, "author": author_name}
+    return {
+        "url": url,
+        "author": author_name
+    }
 
 
 def check_authorship(applicant_name, urls):
