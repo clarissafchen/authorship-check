@@ -1,9 +1,9 @@
-import streamlit as st
+ximport streamlit as st
 from directory_scraper import scrape_expert_directory
 from authorship_check import check_authorship
 import pandas as pd
 
-st.title("🕵️ Authorship Verifier for Expert Directories")
+st.title("🔎 Authorship Verifier for Expert/Contributor Applications")
 st.markdown("Submit a directory URL to check whether submitted content is actually authored by each expert.")
 
 # Input: Directory URL
