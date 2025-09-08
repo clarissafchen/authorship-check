@@ -7,17 +7,26 @@ from authorship_check import check_authorship
 # For Streamlit Cloud: install Chromium for Playwright
 os.system("playwright install chromium")
 
-# Page setup
+# Streamlit app setup
 st.set_page_config(page_title="Authorship Verification Tool", layout="wide")
 st.title("🕵️ Authorship Verification Tool")
 
-# Tabs
 tab1, tab2 = st.tabs([
     "📂 Scrape + Check Directory",
     "📝 Check Author-Submitted Content"
 ])
 
-# ---------------------- TAB 1 ----------------------
+# --------------------------------
+# 🔹 Shared function: highlight mismatches
+# --------------------------------
+def highlight_mismatch(row):
+    if row["Match"] is False:
+        return ['background-color: #ffe6e6'] * len(row)  # Light red
+    return [''] * len(row)
+
+# --------------------------------
+# 📂 TAB 1: Scrape Directory
+# --------------------------------
 with tab1:
     st.subheader("📂 Scrape Expert Directory and Verify Authorship")
 
@@ -27,56 +36,65 @@ with tab1:
     )
 
     if st.button("Scrape & Verify Authorship", key="scrape_button"):
-        with st.spinner("Scraping expert cards and verifying authorship..."):
+        # Only use spinner for scraping step
+        with st.spinner("Scraping expert cards from the directory..."):
             try:
                 expert_data = scrape_expert_directory(directory_url)
-
-                if not expert_data:
-                    st.warning("⚠️ No experts or links found. Check the directory URL or scraping logic.")
-                else:
-                    all_results = []
-                    total_experts = len(expert_data)
-                    progress = st.progress(0)
-                    progress_text = st.empty()
-
-                    for i, (expert_name, urls) in enumerate(expert_data.items()):
-                        if not urls:
-                            continue
-
-                        progress_text.text(f"🔍 Verifying: {expert_name} ({i + 1}/{total_experts})")
-                        results = check_authorship(expert_name, urls)
-
-                        for r in results:
-                            all_results.append({
-                                "Expert": expert_name,
-                                "Submitted URL": r['url'],
-                                "Detected Author": r.get("author"),
-                                "Match": r['match'],
-                                "Reason": r['reason']
-                            })
-
-                        progress.progress((i + 1) / total_experts)
-
-                    progress_text.text("✅ All authorship checks completed.")
-
-                    if all_results:
-                        st.success("✅ Scraping and authorship verification complete.")
-                        df = pd.DataFrame(all_results)
-                        st.dataframe(df, use_container_width=True)
-
-                        csv = df.to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            label="📥 Download results as CSV",
-                            data=csv,
-                            file_name="authorship_verification_results.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.warning("⚠️ No author data could be extracted from the submitted URLs.")
             except Exception as e:
-                st.error(f"❌ Error during scraping or verification: {e}")
+                st.error(f"❌ Error scraping directory: {e}")
+                expert_data = None
 
-# ---------------------- TAB 2 ----------------------
+        if not expert_data:
+            st.warning("⚠️ No experts or links found. Check the directory URL or scraping logic.")
+        else:
+            all_results = []
+            total_experts = len(expert_data)
+            progress = st.progress(0)
+            progress_text = st.empty()
+
+            for i, (expert_name, urls) in enumerate(expert_data.items()):
+                if not urls:
+                    continue
+
+                progress_text.text(f"🔍 Verifying: {expert_name} ({i + 1}/{total_experts})")
+                results = check_authorship(expert_name, urls)
+
+                for r in results:
+                    all_results.append({
+                        "Expert": expert_name,
+                        "Submitted URL": r['url'],
+                        "Detected Author": r.get("author"),
+                        "Match": r['match'],
+                        "Reason": r['reason']
+                    })
+
+                progress.progress((i + 1) / total_experts)
+
+            progress_text.text("✅ All authorship checks completed.")
+
+            if all_results:
+                st.success("✅ Scraping and authorship verification complete.")
+                df = pd.DataFrame(all_results)
+
+                # Highlight mismatches
+                styled_df = df.style.apply(highlight_mismatch, axis=1)
+
+                st.subheader("📊 Authorship Evaluation Results")
+                st.dataframe(styled_df, use_container_width=True)
+
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Download results as CSV",
+                    data=csv,
+                    file_name="authorship_verification_results.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("⚠️ No author data could be extracted from the submitted URLs.")
+
+# --------------------------------
+# 📝 TAB 2: Manual Submission
+# --------------------------------
 with tab2:
     st.subheader("📝 Check Author-Submitted Content")
 
@@ -107,7 +125,8 @@ with tab2:
                             "Reason": r['reason']
                         } for r in results])
 
-                        st.dataframe(df, use_container_width=True)
+                        styled_df = df.style.apply(highlight_mismatch, axis=1)
+                        st.dataframe(styled_df, use_container_width=True)
 
                         csv = df.to_csv(index=False).encode("utf-8")
                         st.download_button(
