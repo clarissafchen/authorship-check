@@ -1,4 +1,4 @@
-ximport streamlit as st
+import streamlit as st
 from directory_scraper import scrape_expert_directory
 from authorship_check import check_authorship
 import pandas as pd
