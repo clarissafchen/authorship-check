@@ -32,18 +32,30 @@ def check_authorship(applicant_name, urls):
     results = []
     for url in urls:
         info = extract_author_info(url)
-        if "error" in info:
-            info.update({"match": False, "reason": "Failed to fetch or parse"})
-        else:
-            normalized_author = info.get("author", "").lower().strip()
-            normalized_applicant = applicant_name.lower().strip()
-            info["match"] = normalized_applicant in normalized_author if normalized_author else False
-            info["reason"] = (
-                "Match" if info["match"] else
-                "Author not attributed" if not info.get("author") else
-                f"Attributed to different author: {info['author']}"
-            )
+
+        # Fix starts here — skip if extract_author_info returned None
+        if info is None:
+            results.append({
+                "url": url,
+                "author": None,
+                "match": False,
+                "reason": "Extraction failed (returned None)"
+            })
+            continue
+
+        # Defensive defaults
+        author_raw = info.get("author") or ""
+        normalized_author = author_raw.lower().strip()
+        normalized_applicant = applicant_name.lower().strip()
+
+        info["match"] = normalized_applicant in normalized_author if normalized_author else False
+        info["reason"] = (
+            "Match" if info["match"] else
+            "Author not attributed" if not author_raw else
+            f"Attributed to different author: {author_raw}"
+        )
         results.append(info)
+
     return results
 
 
