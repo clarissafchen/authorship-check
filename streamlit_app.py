@@ -27,12 +27,12 @@ DEFAULT_UA = (
 REQ_TIMEOUT = 15
 
 # Try to import Playwright lazily (optional).
-PLAYWRIGHT_OK = False
+PLAYWRIGHT_IMPORTED = False
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError  # type: ignore
-    PLAYWRIGHT_OK = True
+    PLAYWRIGHT_IMPORTED = True
 except Exception:
-    PLAYWRIGHT_OK = False
+    PLAYWRIGHT_IMPORTED = False
 
 # ---------- Small helpers
 def norm_space(s: str) -> str:
@@ -49,7 +49,7 @@ def to_ascii_lower(s: str) -> str:
     except Exception:
         pass
     s = s.lower().strip()
-    s = re.sub(r"[^\w\s-]", " ", s)  # keep word-ish
+    s = re.sub(r"[^\w\s-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -92,32 +92,44 @@ def fetch_html_requests(url: str, headers: Optional[dict] = None) -> Tuple[str, 
     )
     return html, diag
 
-def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout_ms: int = 8000) -> Tuple[Optional[str], Optional[HTTPDiag], Optional[str]]:
+# --- one-time install helper (works on Streamlit Cloud & local)
+def install_playwright_browsers() -> Tuple[bool, str]:
+    if not PLAYWRIGHT_IMPORTED:
+        return False, "Playwright not imported"
+    import subprocess, sys
+    try:
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        ok = (proc.returncode == 0)
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        return ok, out
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout_ms: int = 10000) -> Tuple[Optional[str], Optional[HTTPDiag], Optional[str]]:
     """
     Returns (html, diag, error). Uses Chromium headless to render JS.
+    If the browser binary is missing, auto-installs and retries once.
     """
-    if not PLAYWRIGHT_OK:
+    if not PLAYWRIGHT_IMPORTED:
         return None, None, "playwright_not_available"
 
-    try:
+    def _launch_and_get() -> Tuple[str, HTTPDiag]:
         t0 = time.time()
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context(user_agent=DEFAULT_UA, locale="en-US")
             page = ctx.new_page()
             resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            # Wait for either explicit grid card or at least the container
             selector = wait_selector or "article.expert-card, .experts-grid article, .experts-grid [data-cats]"
             try:
                 page.wait_for_selector(selector, timeout=timeout_ms)
             except PWTimeoutError:
-                # Still try to read content; maybe schema.org exists
                 pass
             html = page.content()
             final_url = page.url
             status = resp.status if resp else 200
             browser.close()
-
         diag = HTTPDiag(
             requested_url=url,
             final_url=final_url,
@@ -126,44 +138,52 @@ def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout
             length=len(html or ""),
             engine="playwright",
         )
+        return html, diag
+
+    try:
+        html, diag = _launch_and_get()
         return html, diag, None
     except Exception as e:
+        msg = str(e)
+        needs_install = ("Executable doesn't exist" in msg) or ("playwright was just installed" in msg.lower())
+        if needs_install:
+            ok, out = install_playwright_browsers()
+            if not ok:
+                return None, None, f"playwright_install_failed: {out.strip()}"
+            # retry once
+            try:
+                html, diag = _launch_and_get()
+                return html, diag, None
+            except Exception as e2:
+                return None, None, f"{type(e2).__name__}: {e2}"
         return None, None, f"{type(e).__name__}: {e}"
 
 # ---------- Parsers (Grid + JSON-LD Person)
 def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Be flexible about selectors
     cards = soup.select("article.expert-card")
     if not cards:
-        # Also allow any element with data-cats inside .experts-grid
         cards = soup.select(".experts-grid article, .experts-grid [data-cats]")
 
     results: List[Dict[str, Any]] = []
 
     for c in cards:
-        # Photo
         img = c.select_one(".photo-wrap img") or c.select_one("img")
         photo = img.get("src") if img else None
 
-        # Name + profile link
         name_a = c.select_one("h3.name a")
         name_text = safe_text(name_a) if name_a else safe_text(c.select_one("h3.name"))
         profile_url = name_a.get("href") if name_a else None
 
-        # Site icon link
         site_a = c.select_one(".icons a.site, .icons .icon-link.site, a.icon-link.site")
         website = site_a.get("href") if site_a else None
 
-        # Chips (categories)
         chips = [safe_text(x) for x in c.select(".chips-row .chip, .chip[data-chip]")]
         chips = [x for x in chips if x]
 
-        # Reason (why follow)
         reason = safe_text(c.select_one(".reason"))
 
-        # Resources list
         resources = []
         for a in c.select(".resources-list a.res-pill, .resources a"):
             href = a.get("href")
@@ -232,33 +252,26 @@ def parse_schema_person(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
     return people, diag
 
 def scrape_experts(url: str, prefer_js: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
-    """
-    Try: requests -> parse. If nothing found and JS is allowed, try Playwright.
-    """
     html, http_req = fetch_html_requests(url)
     grid, d_grid = parse_grid_cards(html)
     if grid:
         return grid, {"http": asdict(http_req), "parse": asdict(d_grid)}, None
 
-    # If no grid via requests, see if schema.org person exists
     persons, d_schema = parse_schema_person(html)
     if persons:
         return persons, {"http": asdict(http_req), "parse": {"parser": "schema_person", **d_schema.details}}, None
 
-    # If still empty, try JS rendering (if available or allowed)
     if prefer_js:
         js_html, http_js, js_err = fetch_html_playwright(url, wait_selector="article.expert-card, .experts-grid [data-cats]")
         if js_html and http_js:
             grid2, d_grid2 = parse_grid_cards(js_html)
             if grid2:
                 return grid2, {"http": asdict(http_js), "parse": asdict(d_grid2)}, None
-            # try schema from rendered
             persons2, d_schema2 = parse_schema_person(js_html)
             if persons2:
                 return persons2, {"http": asdict(http_js), "parse": {"parser": "schema_person", **d_schema2.details}}, None
             return [], {"http": asdict(http_js), "parse": {"parser": "mlforseo_grid_css", "cards_found": 0, "experts_parsed": 0}}, None
         else:
-            # No JS engine available or failed
             diag = {"http": asdict(http_req), "parse": {"auto": {
                 "mlforseo_grid": {"parser": "mlforseo_grid_css", "cards_found": 0, "experts_parsed": 0},
                 "schema_person": {"parser": "schema_person", "persons_found": 0, "jsonld_hits": 0}
@@ -267,7 +280,6 @@ def scrape_experts(url: str, prefer_js: bool = True) -> Tuple[List[Dict[str, Any
                 diag["js_error"] = js_err
             return [], diag, js_err
 
-    # Requests only + nothing found
     return [], {
         "http": asdict(http_req),
         "parse": {"mlforseo_grid_css": {"cards_found": 0, "experts_parsed": 0}}
@@ -278,7 +290,6 @@ def guess_author_from_meta_and_jsonld(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     candidates: List[str] = []
 
-    # Common meta tags
     for sel in [
         'meta[name="author"]',
         'meta[property="article:author"]',
@@ -291,14 +302,12 @@ def guess_author_from_meta_and_jsonld(html: str) -> List[str]:
             if v:
                 candidates.append(v)
 
-    # Visible byline hints
     for sel in ["[rel='author']", ".byline a", ".author a", ".author-name", '[itemprop="author"] [itemprop="name"]']:
         for el in soup.select(sel):
             t = safe_text(el)
             if t:
                 candidates.append(t)
 
-    # JSON-LD @type Person
     scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
     for s in scripts:
         try:
@@ -321,7 +330,6 @@ def guess_author_from_meta_and_jsonld(html: str) -> List[str]:
 
         _collect(data)
 
-    # Dedup, keep order
     seen = set()
     uniq = []
     for c in candidates:
@@ -335,7 +343,6 @@ def slug_tokens_from_url(url: str) -> List[str]:
     try:
         p = urlparse(url)
         path = unquote(p.path or "")
-        # keep letters/digits/hyphen
         path = re.sub(r"[^A-Za-z0-9/_\-]", " ", path)
         toks = token_set(path)
         return toks
@@ -343,10 +350,6 @@ def slug_tokens_from_url(url: str) -> List[str]:
         return []
 
 def linkedin_pulse_match(author: str, url: str) -> Tuple[bool, float, str, Optional[str]]:
-    """
-    LinkedIn Pulse often blocks scraping; rely on URL slug when needed.
-    Matches if both first & last tokens from author appear in the path tokens.
-    """
     a_toks = [t for t in token_set(author) if t]
     if len(a_toks) < 1:
         return False, 0.0, "no_author_tokens", None
@@ -355,14 +358,12 @@ def linkedin_pulse_match(author: str, url: str) -> Tuple[bool, float, str, Optio
     if not path_tokens:
         return False, 0.0, "no_path_tokens", None
 
-    # Require at least 2 author tokens (first & last) present in path
     need = {a_toks[0]}
     if len(a_toks) >= 2:
         need.add(a_toks[-1])
 
     present = need.issubset(set(path_tokens))
     if present:
-        # confidence a bit below perfect; slug-based
         return True, 0.7, "linkedin_slug_match", None
     return False, 0.0, "linkedin_slug_no_match", None
 
@@ -371,7 +372,6 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
     norm_author = to_ascii_lower(author)
     author_tokens = token_set(author)
 
-    # Domain-specific shortcut for LinkedIn Pulse
     if "linkedin.com" in domain and "/pulse/" in url:
         ok, conf, method, _ = linkedin_pulse_match(author, url)
         result = {
@@ -383,27 +383,23 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "match": bool(ok),
             "note": "Slug-based verification for LinkedIn Pulse",
         }
-        # If we can fetch, try to upgrade confidence using meta/jsonld
         try:
-            html, httpd = fetch_html_requests(url)
+            html, _ = fetch_html_requests(url)
             cands = guess_author_from_meta_and_jsonld(html)
-            if cands:
-                # see if any meta cand matches
-                for cand in cands:
-                    if to_ascii_lower(cand) == norm_author:
-                        result["detected_author"] = cand
-                        result["method"] = "meta/jsonld"
-                        result["confidence"] = 0.95
-                        result["match"] = True
-                        result["note"] = "Confirmed via meta/JSON-LD"
-                        break
+            for cand in cands:
+                if to_ascii_lower(cand) == norm_author:
+                    result["detected_author"] = cand
+                    result["method"] = "meta/jsonld"
+                    result["confidence"] = 0.95
+                    result["match"] = True
+                    result["note"] = "Confirmed via meta/JSON-LD"
+                    break
         except Exception:
             pass
         return result
 
-    # Generic path: try to fetch and extract
     try:
-        html, httpd = fetch_html_requests(url)
+        html, _ = fetch_html_requests(url)
         cands = guess_author_from_meta_and_jsonld(html)
     except Exception as e:
         return {
@@ -427,7 +423,6 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             conf = 0.95
             break
 
-    # If still nothing, fall back to slug tokens
     if not detected:
         path_toks = slug_tokens_from_url(url)
         need = set()
@@ -453,7 +448,6 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
 
 # ---------- UI
 st.set_page_config(page_title="MLforSEO Tools", page_icon="🧰", layout="wide")
-
 st.title("MLforSEO Tools")
 
 tab1, tab2 = st.tabs(["🔎 Scrape Experts Grid", "📝 Check Author-Submitted Content"])
@@ -472,17 +466,26 @@ with tab1:
         use_js = st.checkbox("Render JavaScript (headless browser)", value=True,
                              help="Uses Playwright to render the page so JS-injected grids can be scraped.")
     with coly:
-        st.caption("Playwright available: **{}**".format("✅" if PLAYWRIGHT_OK else "❌"))
+        st.caption("Playwright imported: **{}**".format("✅" if PLAYWRIGHT_IMPORTED else "❌"))
 
-    if st.button("Scrape Experts", type="primary", use_container_width=False):
+    # Optional one-click installer in the UI
+    if use_js and PLAYWRIGHT_IMPORTED:
+        if st.button("🔧 One-time setup: install headless Chromium"):
+            with st.spinner("Installing Playwright browser (chromium)…"):
+                ok, out = install_playwright_browsers()
+            st.toast("Playwright browser installed." if ok else "Playwright install failed.", icon="✅" if ok else "❌")
+            st.expander("Install output").code(out)
+
+    if st.button("Scrape Experts", type="primary"):
         with st.spinner("Fetching and parsing…"):
             data, diag, js_err = scrape_experts(url, prefer_js=use_js)
 
-        # Status message
         total = len(data)
-        st.success(f"Found {total} expert(s).") if total else st.info("Found 0 experts.")
+        if total:
+            st.success(f"Found {total} expert(s).")
+        else:
+            st.info("Found 0 experts.")
 
-        # Results table
         if data:
             flat_rows = []
             for item in data:
@@ -498,29 +501,23 @@ with tab1:
             df = pd.DataFrame(flat_rows)
 
             if show_photos and "photo" in df.columns:
-                # Show a quick image preview column as markdown
-                def _img_md(u):
-                    return f"![]({u})" if u else ""
+                def _img_md(u): return f"![]({u})" if u else ""
                 df_disp = df.copy()
                 df_disp["photo"] = df_disp["photo"].map(_img_md)
                 st.dataframe(df_disp, use_container_width=True)
             else:
                 st.dataframe(df, use_container_width=True)
 
-            # Downloads
             jbytes = json.dumps(data, indent=2).encode("utf-8")
             dl_button_bytes("Download JSON", jbytes, "experts.json", "application/json")
             dl_button_bytes("Download CSV", df.to_csv(index=False).encode("utf-8"), "experts.csv", "text/csv")
 
-        # Diagnostics
         with st.expander("Diagnostics"):
             st.code(json.dumps(diag, indent=2))
             if js_err and use_js:
-                if js_err == "playwright_not_available":
-                    st.warning("Playwright is not available. Install with:\n\n"
-                               "```bash\npip install playwright\nplaywright install chromium\n```")
-                else:
-                    st.warning(f"JS rendering error: {js_err}")
+                st.warning(f"JS rendering error: {js_err}")
+                if "playwright_install_failed" in js_err or "not_available" in js_err:
+                    st.info("Click the **🔧 One-time setup** button above, then try again.")
 
 with tab2:
     st.subheader("Verify an author name against one or more URLs.")
@@ -536,19 +533,17 @@ with tab2:
 
     if st.button("Run Checks", type="primary"):
         urls = [u.strip() for u in urls_raw.split(",") if u.strip()]
-        rows = []
-        for u in urls:
-            res = verify_authorship(author_name, u)
-            rows.append(res)
+        rows = [verify_authorship(author_name, u) for u in urls]
 
         df = pd.DataFrame(rows, columns=["url","declared_author","detected_author","method","confidence","match","note"])
         st.dataframe(df, use_container_width=True)
 
-        # Quick verdict summary
         ok = sum(1 for r in rows if r.get("match"))
-        st.success(f"{ok}/{len(rows)} URLs matched the declared author.") if ok else st.error("No matches found.")
+        if ok:
+            st.success(f"{ok}/{len(rows)} URLs matched the declared author.")
+        else:
+            st.error("No matches found.")
 
-        # Download results
         jbytes = json.dumps(rows, indent=2).encode("utf-8")
         dl_button_bytes("Download JSON", jbytes, "author_checks.json", "application/json")
         dl_button_bytes("Download CSV", df.to_csv(index=False).encode("utf-8"), "author_checks.csv", "text/csv")
