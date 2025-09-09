@@ -92,7 +92,7 @@ def fetch_html_requests(url: str, headers: Optional[dict] = None) -> Tuple[str, 
     )
     return html, diag
 
-# --- one-time install helper (works on Streamlit Cloud & local)
+# --- one-time install helper
 def install_playwright_browsers() -> Tuple[bool, str]:
     if not PLAYWRIGHT_IMPORTED:
         return False, "Playwright not imported"
@@ -107,10 +107,6 @@ def install_playwright_browsers() -> Tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout_ms: int = 10000) -> Tuple[Optional[str], Optional[HTTPDiag], Optional[str]]:
-    """
-    Returns (html, diag, error). Uses Chromium headless to render JS.
-    If the browser binary is missing, auto-installs and retries once.
-    """
     if not PLAYWRIGHT_IMPORTED:
         return None, None, "playwright_not_available"
 
@@ -150,7 +146,6 @@ def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout
             ok, out = install_playwright_browsers()
             if not ok:
                 return None, None, f"playwright_install_failed: {out.strip()}"
-            # retry once
             try:
                 html, diag = _launch_and_get()
                 return html, diag, None
@@ -173,7 +168,7 @@ def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
         photo = img.get("src") if img else None
 
         name_a = c.select_one("h3.name a")
-        name_text = safe_text(name_a) if name_a else safe_text(c.select_one("h3.name"))
+        author_text = safe_text(name_a) if name_a else safe_text(c.select_one("h3.name"))
         profile_url = name_a.get("href") if name_a else None
 
         site_a = c.select_one(".icons a.site, .icons .icon-link.site, a.icon-link.site")
@@ -195,10 +190,10 @@ def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
             if href:
                 resources.append({"href": href, "label": label, "favicon": fav})
 
-        if name_text:
+        if author_text:
             results.append(
                 {
-                    "name": name_text,
+                    "author": author_text,           # <-- renamed from "name"
                     "profile_url": profile_url,
                     "website": website,
                     "photo": photo,
@@ -236,7 +231,7 @@ def parse_schema_person(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
                 if t == "Person" or (isinstance(t, list) and "Person" in t):
                     hits += 1
                     person = {
-                        "name": obj.get("name"),
+                        "author": obj.get("name"),
                         "jobTitle": obj.get("jobTitle"),
                         "url": obj.get("url"),
                         "sameAs": obj.get("sameAs"),
@@ -285,7 +280,7 @@ def scrape_experts(url: str, prefer_js: bool = True) -> Tuple[List[Dict[str, Any
         "parse": {"mlforseo_grid_css": {"cards_found": 0, "experts_parsed": 0}}
     }, None
 
-# ---------- Author verification (Tab 2)
+# ---------- Author verification (shared with Tab 2)
 def guess_author_from_meta_and_jsonld(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     candidates: List[str] = []
@@ -382,6 +377,7 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "confidence": conf,
             "match": bool(ok),
             "note": "Slug-based verification for LinkedIn Pulse",
+            "domain": domain
         }
         try:
             html, _ = fetch_html_requests(url)
@@ -410,6 +406,7 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "confidence": 0.0,
             "match": False,
             "note": f"{type(e).__name__}: {e}",
+            "domain": domain
         }
 
     detected = None
@@ -444,6 +441,34 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
         "confidence": conf,
         "match": bool(detected),
         "note": "" if detected else "No author detected from meta/JSON-LD or slug",
+        "domain": domain
+    }
+
+def evaluate_authorship_for_resources(author: str, resources: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Evaluate each resource link for authorship; return summary + per-link details."""
+    evaluations = []
+    authored = 0
+    total = 0
+
+    for r in resources or []:
+        url = r.get("href")
+        label = r.get("label")
+        if not url:
+            continue
+        total += 1
+        res = verify_authorship(author, url)
+        res["label"] = label
+        res["favicon"] = r.get("favicon")
+        if res.get("match"):
+            authored += 1
+        evaluations.append(res)
+
+    rate = (authored / total) if total else 0.0
+    return {
+        "resources_authored": authored,
+        "resources_total": total,
+        "authorship_rate": rate,
+        "evaluations": evaluations
     }
 
 # ---------- UI
@@ -453,7 +478,7 @@ st.title("MLforSEO Tools")
 tab1, tab2 = st.tabs(["🔎 Scrape Experts Grid", "📝 Check Author-Submitted Content"])
 
 with tab1:
-    st.subheader("Scrape the experts grid from mlforseo.com/experts and export results.")
+    st.subheader("Scrape the experts grid and verify resource authorship.")
 
     col_l, col_r = st.columns([2, 1])
     with col_l:
@@ -461,14 +486,14 @@ with tab1:
     with col_r:
         show_photos = st.checkbox("Show headshots", value=False)
 
-    colx, coly = st.columns([1,1])
+    colx, coly, colz = st.columns([1,1,1])
     with colx:
-        use_js = st.checkbox("Render JavaScript (headless browser)", value=True,
-                             help="Uses Playwright to render the page so JS-injected grids can be scraped.")
+        use_js = st.checkbox("Render JavaScript (headless browser)", value=True)
     with coly:
         st.caption("Playwright imported: **{}**".format("✅" if PLAYWRIGHT_IMPORTED else "❌"))
+    with colz:
+        do_eval = st.checkbox("Evaluate authorship of resource links", value=True)
 
-    # Optional one-click installer in the UI
     if use_js and PLAYWRIGHT_IMPORTED:
         if st.button("🔧 One-time setup: install headless Chromium"):
             with st.spinner("Installing Playwright browser (chromium)…"):
@@ -480,23 +505,58 @@ with tab1:
         with st.spinner("Fetching and parsing…"):
             data, diag, js_err = scrape_experts(url, prefer_js=use_js)
 
-        total = len(data)
-        if total:
-            st.success(f"Found {total} expert(s).")
+        total_experts = len(data)
+        if total_experts:
+            st.success(f"Found {total_experts} expert(s).")
         else:
             st.info("Found 0 experts.")
 
+        # Optionally evaluate authorship for each expert's resources
+        per_resource_rows = []
+        if data and do_eval:
+            prog = st.progress(0.0, text="Evaluating authorship for resource links…")
+            for i, item in enumerate(data):
+                author = item.get("author")
+                resources = item.get("resources") or []
+                eval_pack = evaluate_authorship_for_resources(author, resources)
+                # attach summary back on the expert item
+                item["resources_authored"] = eval_pack["resources_authored"]
+                item["resources_total"] = eval_pack["resources_total"]
+                item["authorship_rate"] = eval_pack["authorship_rate"]
+                item["resource_evaluations"] = eval_pack["evaluations"]
+
+                # flatten per-resource evaluation rows for separate table/export
+                for ev in eval_pack["evaluations"]:
+                    per_resource_rows.append({
+                        "author": author,
+                        "url": ev.get("url"),
+                        "domain": ev.get("domain"),
+                        "label": ev.get("label"),
+                        "method": ev.get("method"),
+                        "confidence": ev.get("confidence"),
+                        "match": ev.get("match"),
+                        "detected_author": ev.get("detected_author"),
+                        "note": ev.get("note"),
+                    })
+                if total_experts:
+                    prog.progress((i+1)/total_experts)
+            prog.empty()
+
         if data:
+            # Build the main experts table
             flat_rows = []
             for item in data:
                 flat_rows.append({
-                    "name": item.get("name"),
+                    "author": item.get("author"),
                     "profile_url": item.get("profile_url"),
                     "website": item.get("website"),
                     "photo": item.get("photo"),
                     "categories": ", ".join(item.get("categories") or []),
                     "reason": item.get("reason"),
                     "resources": ", ".join([r.get("href") for r in item.get("resources", [])]),
+                    "resources_authored": item.get("resources_authored", None),
+                    "resources_total": item.get("resources_total", None),
+                    "authorship_rate": item.get("authorship_rate", None),
                 })
             df = pd.DataFrame(flat_rows)
 
@@ -508,9 +568,20 @@ with tab1:
             else:
                 st.dataframe(df, use_container_width=True)
 
+            # Downloads for experts
             jbytes = json.dumps(data, indent=2).encode("utf-8")
-            dl_button_bytes("Download JSON", jbytes, "experts.json", "application/json")
-            dl_button_bytes("Download CSV", df.to_csv(index=False).encode("utf-8"), "experts.csv", "text/csv")
+            dl_button_bytes("Download Experts JSON", jbytes, "experts.json", "application/json")
+            dl_button_bytes("Download Experts CSV", df.to_csv(index=False).encode("utf-8"), "experts.csv", "text/csv")
+
+            # Per-resource evaluations table/export (if any)
+            if per_resource_rows:
+                st.markdown("**Per-resource authorship checks**")
+                df_ev = pd.DataFrame(per_resource_rows)
+                st.dataframe(df_ev, use_container_width=True)
+                dl_button_bytes("Download Resource Checks JSON", json.dumps(per_resource_rows, indent=2).encode("utf-8"),
+                                "resource_checks.json", "application/json")
+                dl_button_bytes("Download Resource Checks CSV", df_ev.to_csv(index=False).encode("utf-8"),
+                                "resource_checks.csv", "text/csv")
 
         with st.expander("Diagnostics"):
             st.code(json.dumps(diag, indent=2))
@@ -535,7 +606,7 @@ with tab2:
         urls = [u.strip() for u in urls_raw.split(",") if u.strip()]
         rows = [verify_authorship(author_name, u) for u in urls]
 
-        df = pd.DataFrame(rows, columns=["url","declared_author","detected_author","method","confidence","match","note"])
+        df = pd.DataFrame(rows, columns=["url","declared_author","detected_author","method","confidence","match","note","domain"])
         st.dataframe(df, use_container_width=True)
 
         ok = sum(1 for r in rows if r.get("match"))
