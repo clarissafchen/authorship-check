@@ -7,608 +7,511 @@
 # - LinkedIn Pulse often blocks bots; we add slug heuristics + JSON-LD regex fallback
 # - Matching uses normalized tokens + fuzzy ratio (difflib) to classify MATCH/POSSIBLE/NO_MATCH
 
+# streamlit_app.py
 import re
-import time
+import csv
+import io
 import json
-import html
-import unicodedata
-from urllib.parse import urljoin, urlparse, parse_qs, urlunparse
+import time
+import difflib
+from urllib.parse import urlparse, urlunparse
 
 import requests
-import pandas as pd
-import streamlit as st
 from bs4 import BeautifulSoup
-from difflib import SequenceMatcher
+import streamlit as st
 
-st.set_page_config(page_title="MLforSEO Tools", layout="wide")
+APP_TITLE = "MLforSEO Tools"
+DEFAULT_EXPERTS_URL = "https://www.mlforseo.com/experts/"
 
-# -------------------- Shared HTTP utils --------------------
-
-BROWSER_HEADERS = {
+HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
-def _normalize_url(href: str, base: str) -> str:
-    if not href:
-        return ""
-    href = href.strip()
-    if href.startswith(("http://", "https://")):
-        return href
-    if href.startswith("//"):
-        return "https:" + href
-    # bare domain/path like linkedin.com/..., github.com/...
-    if re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", href, flags=re.I):
-        return "https://" + href
-    return urljoin(base, href)
+# -------------------- Utilities
 
-def _strip_tracking(u: str) -> str:
-    """Remove common tracking query params but preserve core path."""
+def normalize_name(s: str) -> str:
+    s = s or ""
+    s = s.lower().strip()
+    s = re.sub(r"[\u2019'’`]", "", s)
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def fuzzy_same_author(a: str, b: str, threshold=0.84) -> bool:
+    na, nb = normalize_name(a), normalize_name(b)
+    if difflib.SequenceMatcher(None, na, nb).ratio() >= threshold:
+        return True
+    sa = " ".join(sorted(na.split()))
+    sb = " ".join(sorted(nb.split()))
+    return difflib.SequenceMatcher(None, sa, sb).ratio() >= threshold
+
+def to_csv_bytes(rows, fieldnames):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in fieldnames})
+    return buf.getvalue().encode("utf-8")
+
+def canonicalize(u: str) -> str:
     try:
-        parsed = urlparse(u)
-        qs = parse_qs(parsed.query)
-        # Keep nothing unless specifically useful; LinkedIn trackingId not needed.
-        cleaned = parsed._replace(query="")
-        return urlunparse(cleaned)
+        p = urlparse(u)
+        qs = re.sub(r"(^|&)(utm_[^=]+|fbclid|gclid|trackingId)=[^&]*", "", p.query)
+        qs = re.sub(r"&&+", "&", qs).strip("&")
+        return urlunparse((p.scheme, p.netloc, p.path, "", qs, ""))
     except Exception:
         return u
 
-def _fetch_html(url: str, retries: int = 3, timeout: int = 15, sleep_factor: float = 1.3) -> str:
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout)
-            if r.status_code == 200 and r.text:
-                return r.text
-            # common anti-bot/ratelimit statuses (LinkedIn returns 999 sometimes; treat like 429)
-            if r.status_code in (403, 429, 503, 999):
-                time.sleep(sleep_factor * (i + 1))
-                continue
-            r.raise_for_status()
-        except Exception as e:
-            last_err = e
-            time.sleep(sleep_factor * (i + 1))
-    raise RuntimeError(f"Failed to fetch HTML from {url}: {last_err}")
-
-def _soup(html_text: str) -> BeautifulSoup:
-    return BeautifulSoup(html_text, "lxml")
-
-# -------------------- Tab 1: Experts Grid Scraper --------------------
-
-def _parse_expert_card(card, base_url: str) -> dict:
-    name_a = card.select_one("h3.name a")
-    img = card.select_one(".photo-wrap img")
-    site_a = card.select_one(".icons a.site")
-
-    data_cats = html.unescape(card.get("data-cats") or "")
-    categories = [c.strip() for c in data_cats.split("|") if c.strip()]
-
-    chips = [
-        (chip.get("data-chip") or chip.get_text(strip=True))
-        for chip in card.select(".chips-row .chip")
-    ]
-
-    resources = []
-    for a in card.select(".resources-list a.res-pill"):
-        raw = a.get("href") or ""
-        url_abs = _normalize_url(raw, base_url)
-        domain_el = a.select_one(".res-text")
-        domain = (domain_el.get_text(strip=True)
-                  if domain_el else urlparse(url_abs).netloc.replace("www.", ""))
-        favicon = ""
-        fav_el = a.select_one("img.res-favicon")
-        if fav_el and fav_el.has_attr("src"):
-            favicon = _normalize_url(fav_el["src"], base_url)
-        resources.append({"url": url_abs, "domain": domain, "favicon": favicon})
-
-    return {
-        "name": name_a.get_text(strip=True) if name_a else "",
-        "linkedin": _normalize_url(name_a.get("href") if name_a else "", base_url),
-        "website": _normalize_url(site_a.get("href") if site_a else "", base_url),
-        "image": _normalize_url(img.get("src") if img else "", base_url),
-        "image_alt": img.get("alt", "") if img else "",
-        "categories": categories,
-        "chips": chips,
-        "reason": (card.select_one(".reason").get_text(strip=True)
-                   if card.select_one(".reason") else ""),
-        "resources": resources,
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_html(url: str):
+    t0 = time.time()
+    resp = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+    elapsed = round((time.time() - t0) * 1000)
+    meta = {
+        "requested_url": url,
+        "final_url": resp.url,
+        "status_code": resp.status_code,
+        "elapsed_ms": elapsed,
+        "length": len(resp.text or ""),
     }
+    resp.raise_for_status()
+    return resp.text, meta
 
-@st.cache_data(show_spinner=False, ttl=600)
-def scrape_mlforseo_experts(url: str = "https://www.mlforseo.com/experts/") -> list[dict]:
-    html_text = _fetch_html(url)
-    soup = _soup(html_text)
-    grid = soup.select_one("#experts-grid")
-    if not grid:
-        raise ValueError("Could not find #experts-grid on the page. The markup may have changed.")
-    cards = grid.select("article.expert-card")
-    return [_parse_expert_card(card, url) for card in cards]
+# -------------------- Parsers
 
-# -------------------- Tab 2: Author Verification --------------------
+def parse_mlforseo_css(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    grid = soup.select_one("#experts-grid.experts-grid")
+    cards = grid.select("article.expert-card") if grid else []
 
-# --- Name normalization + matching ---
+    results = []
+    for art in cards:
+        name_el = art.select_one(".title-row .name a") or art.select_one(".title-row .name")
+        name = name_el.get_text(strip=True) if name_el else ""
 
-_STOP_TITLES = {"mr", "mrs", "ms", "dr", "prof", "sir"}
+        profile_url = ""
+        if name_el and name_el.name == "a" and name_el.has_attr("href"):
+            profile_url = name_el["href"].strip()
 
-def _normalize_name(name: str) -> str:
-    if not name:
-        return ""
-    s = unicodedata.normalize("NFKD", name)
-    s = s.encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"[\u2010-\u2015\-‐-‒–—―]+", "-", s)  # hyphen-ish to hyphen
-    s = re.sub(r"[^\w\s\-']", " ", s)  # drop punctuation except hyphen/apostrophe
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    # drop common titles
-    tokens = [t for t in s.split() if t not in _STOP_TITLES]
-    return " ".join(tokens)
+        site_el = art.select_one(".icons a.site[href]")
+        website = site_el["href"].strip() if site_el else ""
 
-def _name_tokens(name: str) -> list[str]:
-    return [t for t in _normalize_name(name).split() if t]
+        img_el = art.select_one(".photo-wrap img[src]")
+        photo = img_el["src"].strip() if img_el else ""
 
-def _string_ratio(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
+        chips = [c.get("data-chip", "").strip() for c in art.select(".chips-row .chip") if c.get("data-chip")]
+        categories = [c for c in chips if c]
 
-def _token_coverage(author_tokens: list[str], candidate_tokens: list[str]) -> float:
-    if not author_tokens:
-        return 0.0
-    a = set(author_tokens)
-    c = set(candidate_tokens)
-    return len(a & c) / max(1, len(a))
+        reason_el = art.select_one("p.reason")
+        reason = reason_el.get_text(strip=True) if reason_el else ""
 
-# --- Evidence extraction ---
+        resources = []
+        for a in art.select(".resources .resources-list a.res-pill[href]"):
+            href = a["href"].strip()
+            label_el = a.select_one(".res-text")
+            label = label_el.get_text(strip=True) if label_el else urlparse(href).netloc
+            resources.append({"url": href, "label": label})
 
-def _extract_jsonld_candidates(soup: BeautifulSoup) -> list[str]:
-    found = []
+        results.append(
+            {
+                "name": name,
+                "profile_url": profile_url,
+                "website": website,
+                "photo": photo,
+                "categories": categories,
+                "reason": reason,
+                "resources": resources,
+            }
+        )
+    diag = {"parser": "mlforseo_css", "grid_found": grid is not None, "cards_found": len(cards)}
+    return results, diag
+
+def _flatten_json(obj):
+    if isinstance(obj, list):
+        for x in obj:
+            yield from _flatten_json(x)
+    elif isinstance(obj, dict) and "@graph" in obj:
+        yield from _flatten_json(obj["@graph"])
+    else:
+        yield obj
+
+def parse_schema_persons(html: str):
+    """Domain-agnostic: read JSON-LD Person items."""
+    soup = BeautifulSoup(html, "html.parser")
+    persons = []
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        raw = tag.string or ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for node in _flatten_json(data):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            if isinstance(t, list):
+                is_person = any(tt.lower() == "person" for tt in t if isinstance(tt, str))
+            else:
+                is_person = isinstance(t, str) and t.lower() == "person"
+            if not is_person:
+                continue
+
+            name = node.get("name", "")
+            url = node.get("url", "")
+            image = node.get("image", "") or (node.get("photo") if isinstance(node.get("photo"), str) else "")
+            sameas = node.get("sameAs", [])
+            if isinstance(sameas, str):
+                sameas = [sameas]
+            # pick a good profile if available
+            profile_url = ""
+            for s in sameas or []:
+                if "linkedin.com" in s or "twitter.com" in s or "x.com" in s:
+                    profile_url = s
+                    break
+            if not profile_url:
+                profile_url = url
+
+            # categories / topics
+            cats = []
+            for key in ("knowsAbout", "keywords", "areasOfExpertise", "areasServed"):
+                v = node.get(key)
+                if isinstance(v, list):
+                    cats.extend([str(x) for x in v])
+                elif isinstance(v, str):
+                    cats.extend([x.strip() for x in re.split(r"[;,]", v) if x.strip()])
+            cats = list(dict.fromkeys([c for c in cats if c]))
+
+            # resources: use sameAs as a first-class list
+            resources = [{"url": s, "label": urlparse(s).netloc or s} for s in (sameas or [])]
+
+            reason = node.get("description", "")
+            persons.append(
+                {
+                    "name": name,
+                    "profile_url": profile_url,
+                    "website": url,
+                    "photo": image,
+                    "categories": cats,
+                    "reason": reason,
+                    "resources": resources,
+                }
+            )
+    diag = {"parser": "schema_person", "persons_found": len(persons)}
+    return persons, diag
+
+def parse_custom_css(html: str, sel: dict):
+    """
+    Flexible CSS parser. sel keys:
+      card, name, name_link (optional), profile_link, website_link, photo_img,
+      category_chip, reason, resource_link, resource_label
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select(sel.get("card") or "")
+    out = []
+    for art in cards:
+        def pick_text(selector):
+            el = art.select_one(selector) if selector else None
+            return el.get_text(strip=True) if el else ""
+
+        def pick_href(selector):
+            el = art.select_one(selector) if selector else None
+            return el["href"].strip() if el and el.has_attr("href") else ""
+
+        def pick_src(selector):
+            el = art.select_one(selector) if selector else None
+            return el["src"].strip() if el and el.has_attr("src") else ""
+
+        name = pick_text(sel.get("name") or "")
+        if not name and sel.get("name_link"):
+            el = art.select_one(sel["name_link"])
+            name = el.get_text(strip=True) if el else ""
+
+        profile_url = pick_href(sel.get("profile_link") or sel.get("name_link") or "")
+        website = pick_href(sel.get("website_link") or "")
+        photo = pick_src(sel.get("photo_img") or "")
+
+        cats = []
+        chip_sel = sel.get("category_chip")
+        if chip_sel:
+            for chip in art.select(chip_sel):
+                # Try data-chip then text
+                cats.append(chip.get("data-chip", "").strip() or chip.get_text(strip=True))
+        cats = [c for c in cats if c]
+
+        reason = pick_text(sel.get("reason") or "")
+
+        resources = []
+        link_sel = sel.get("resource_link")
+        if link_sel:
+            for a in art.select(link_sel):
+                if not a.has_attr("href"):
+                    continue
+                href = a["href"].strip()
+                label = ""
+                lab_sel = sel.get("resource_label")
+                if lab_sel:
+                    lab_el = a.select_one(lab_sel)
+                    label = lab_el.get_text(strip=True) if lab_el else ""
+                if not label:
+                    label = urlparse(href).netloc or href
+                resources.append({"url": href, "label": label})
+
+        out.append(
+            {
+                "name": name,
+                "profile_url": profile_url,
+                "website": website,
+                "photo": photo,
+                "categories": cats,
+                "reason": reason,
+                "resources": resources,
+            }
+        )
+    diag = {"parser": "custom_css", "cards_found": len(cards)}
+    return out, diag
+
+# -------------------- Author extraction (Tab 2)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_article(url: str):
+    u = canonicalize(url)
+    r = requests.get(u, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+
+    authors = []
+
+    # JSON-LD
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
         except Exception:
-            # sometimes multiple JSON objects concatenated or comments present
-            # try to locate author names via regex
-            txt = script.get_text("", strip=True)
-            for m in re.finditer(r'"author"\s*:\s*(\{.*?\}|\[.*?\])', txt, flags=re.I|re.S):
-                frag = m.group(1)
-                # naive name scrapes
-                for m2 in re.finditer(r'"name"\s*:\s*"([^"]+)"', frag, flags=re.I):
-                    found.append(m2.group(1).strip())
             continue
-
-        def harvest(obj):
-            if isinstance(obj, dict):
-                # author can be dict or list
-                if "author" in obj:
-                    au = obj["author"]
-                    if isinstance(au, dict):
-                        nm = au.get("name")
-                        if nm: found.append(str(nm).strip())
-                    elif isinstance(au, list):
-                        for x in au:
-                            if isinstance(x, dict) and x.get("name"):
-                                found.append(str(x["name"]).strip())
-                # Some sites put creator
-                if "creator" in obj:
-                    cr = obj["creator"]
-                    if isinstance(cr, dict) and cr.get("name"):
-                        found.append(str(cr["name"]).strip())
-                    elif isinstance(cr, list):
-                        for x in cr:
-                            if isinstance(x, dict) and x.get("name"):
-                                found.append(str(x["name"]).strip())
-                # recurse shallowly to catch nested Article/WebPage
-                for v in obj.values():
-                    harvest(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    harvest(it)
-
-        harvest(data)
-    return list({x for x in found if x})
-
-def _extract_meta_candidates(soup: BeautifulSoup) -> list[str]:
-    meta_names = [
-        ('name', 'author'),
-        ('property', 'article:author'),  # can be URL on some sites
-        ('name', 'parsely-author'),
-        ('name', 'byl'),                 # NYT-style "byline"
-        ('name', 'dc.creator'),
-        ('name', 'sailthru.author'),
-    ]
-    names = []
-    for attr, val in meta_names:
-        for m in soup.find_all("meta", {attr: val}):
-            content = (m.get("content") or "").strip()
-            if content:
-                names.append(content)
-    # article:author might be a URL; extract trailing name hint
-    cleaned = []
-    for x in names:
-        if re.match(r"https?://", x):
-            # try to pull a last segment or slug
-            p = urlparse(x)
-            last = p.path.rstrip("/").split("/")[-1].replace("-", " ").strip()
-            if last:
-                cleaned.append(last)
-            else:
-                cleaned.append(x)
-        else:
-            cleaned.append(x)
-    return list({c for c in cleaned if c})
-
-def _extract_byline_candidates(soup: BeautifulSoup) -> list[str]:
-    sel = [
-        '[rel="author"]',
-        '[itemprop="author"]',
-        '.byline', '.by-line', '.post-author', '.author', '.article-author',
-        '.c-article__author', '.meta-author', '.entry-author', '.posted-by'
-    ]
-    candidates = []
-    for s in sel:
-        for el in soup.select(s):
-            t = el.get_text(" ", strip=True)
-            if not t:
+        for node in _flatten_json(data):
+            if not isinstance(node, dict):
                 continue
-            # remove common prefixes
-            t = re.sub(r"^\s*by\s+", "", t, flags=re.I)
-            # trim pipes/labels
-            t = re.sub(r"(?:author|posted by)\s*[:·|-]\s*", "", t, flags=re.I)
-            # keep short-ish strings
-            if 2 <= len(t) <= 120:
-                candidates.append(t)
-    # Title pattern e.g., "Article title — by Jane Doe"
-    ttl = soup.title.get_text(strip=True) if soup.title else ""
-    for m in re.finditer(r"\bby\s+([A-Z][A-Za-z'’\-]+(?:\s+[A-Z][A-Za-z'’\-]+)+)", ttl):
-        candidates.append(m.group(1))
-    return list({c for c in candidates if c})
+            a = node.get("author")
+            if isinstance(a, dict) and a.get("name"):
+                authors.append(a["name"])
+            elif isinstance(a, list):
+                for ai in a:
+                    if isinstance(ai, dict) and ai.get("name"):
+                        authors.append(ai["name"])
 
-def _slug_name_hint(url: str) -> str:
-    try:
-        p = urlparse(url)
-        # LinkedIn Pulse often: /pulse/slug-words-aimee-jurenka-XXXXXXXX
-        # Medium/Substack/WordPress: slug sometimes contains the author, but not always.
-        parts = [x for x in p.path.split("/") if x]
-        if not parts:
-            return ""
-        slug = parts[-1]
-        slug = slug.split("?")[0]
-        hint = slug.replace("-", " ")
-        hint = re.sub(r"\d+", " ", hint)
-        hint = re.sub(r"\s+", " ", hint).strip()
-        return hint
-    except Exception:
-        return ""
+    # Meta fallbacks
+    for attrs in [
+        {"name": "author"},
+        {"property": "author"},
+        {"property": "article:author"},
+        {"property": "og:author"},
+    ]:
+        m = soup.find("meta", attrs=attrs)
+        if m and m.get("content"):
+            authors.append(m["content"])
 
-def _domain_adapter_candidates(url: str, soup: BeautifulSoup, html_text: str) -> list[str]:
-    host = urlparse(url).netloc.lower().replace("www.", "")
-    cands = []
-    if "linkedin.com" in host and "/pulse/" in url:
-        # 1) JSON-LD often present but sometimes blocked – already handled
-        # 2) Regex scrape for author.name inside any JSON in the HTML
-        for m in re.finditer(r'"author"\s*:\s*(\{.*?\}|\[.*?\])', html_text, flags=re.I|re.S):
-            frag = m.group(1)
-            for m2 in re.finditer(r'"name"\s*:\s*"([^"]+)"', frag, flags=re.I):
-                cands.append(m2.group(1).strip())
-        # 3) Slug hint (last resort)
-        cands.append(_slug_name_hint(url))
-    elif "medium.com" in host:
-        # Medium typically has JSON-LD author + rel="author"
-        pass
-    elif host.endswith("substack.com"):
-        # Substack exposes name via meta[name=author] and JSON-LD
-        pass
-    # WordPress often yields meta author + byline already covered
-    return [c for c in cands if c]
-
-def _collect_author_candidates(url: str, html_text: str) -> dict:
-    soup = _soup(html_text)
-    cands = []
-    sources = []
-
-    j = _extract_jsonld_candidates(soup)
-    if j:
-        cands.extend(j); sources.append("jsonld")
-
-    m = _extract_meta_candidates(soup)
-    if m:
-        cands.extend(m); sources.append("meta")
-
-    b = _extract_byline_candidates(soup)
-    if b:
-        cands.extend(b); sources.append("byline")
-
-    d = _domain_adapter_candidates(url, soup, html_text)
-    if d:
-        cands.extend(d); sources.append("domain_adapter")
-
-    # clean + unique
-    cands = [c for c in {x.strip(): None for x in cands if x and x.strip()}.keys()]
-    return {"candidates": cands, "sources": sources, "soup": soup}
-
-# --- Core verification ---
-
-def _classify_author_match(target_name: str, url: str, html_text: str) -> dict:
-    target_tokens = _name_tokens(target_name)
-    out = {
-        "url": url,
-        "canonical_url": None,
-        "domain": urlparse(url).netloc.replace("www.", ""),
-        "decision": "NO_MATCH",
-        "score_ratio": 0.0,
-        "token_coverage": 0.0,
-        "found_candidates": [],
-        "evidence_sources": [],
-        "notes": "",
-    }
-
-    # gather candidates
-    collected = _collect_author_candidates(url, html_text)
-    cands = collected["candidates"]
-    out["evidence_sources"] = list({*collected["sources"]})
-
-    # canonical if present
-    soup = collected["soup"]
-    can = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
-    if can and can.get("href"):
-        out["canonical_url"] = _strip_tracking(_normalize_url(can["href"], url))
+    # LinkedIn byline heuristics
+    host = urlparse(u).netloc.lower()
+    if "linkedin.com" in host:
+        byline = soup.select_one("a[href*='/in/'], a[href*='/author/']")
+        if byline:
+            authors.append(byline.get_text(strip=True))
+        txt = soup.get_text(" ", strip=True)
+        m = re.search(r"\bby\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)", txt, re.I)
+        if m:
+            authors.append(m.group(1))
     else:
-        out["canonical_url"] = _strip_tracking(url)
+        txt = soup.get_text(" ", strip=True)
+        m = re.search(r"\bby\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)", txt, re.I)
+        if m:
+            authors.append(m.group(1))
 
-    # If nothing found, add slug hint as evidence
-    if not cands:
-        sh = _slug_name_hint(url)
-        if sh:
-            cands.append(sh)
-            out["evidence_sources"].append("slug_hint")
-
-    # Evaluate candidates
-    best_ratio = 0.0
-    best_cov = 0.0
-    found_clean = []
-
-    for cand in cands:
-        ratio = _string_ratio(target_name, cand)
-        cov = _token_coverage(target_tokens, _name_tokens(cand))
-        found_clean.append({"candidate": cand, "ratio": round(ratio, 3), "coverage": round(cov, 3)})
-        best_ratio = max(best_ratio, ratio)
-        best_cov = max(best_cov, cov)
-
-    out["found_candidates"] = found_clean
-    out["score_ratio"] = round(best_ratio, 3)
-    out["token_coverage"] = round(best_cov, 3)
-
-    # Decision thresholds (tuned to be forgiving on LinkedIn)
-    # Full match: strong ratio or full token coverage
-    if best_cov >= 1.0 or best_ratio >= 0.90:
-        out["decision"] = "MATCH"
-    # Possible: partial token coverage or decent ratio
-    elif best_cov >= 0.5 or best_ratio >= 0.75:
-        out["decision"] = "POSSIBLE_MATCH"
-    else:
-        out["decision"] = "NO_MATCH"
-
-    # Add small note for LinkedIn Pulse when blocked
-    host = out["domain"]
-    if "linkedin.com" in host and not any(x["ratio"] >= 0.75 or x["coverage"] >= 0.5 for x in found_clean):
-        out["notes"] = "LinkedIn may be blocking bot access; relying on slug heuristics. Consider manual check or HTML upload."
-
-    return out
-
-@st.cache_data(show_spinner=False, ttl=600)
-def verify_author_for_urls(author_name: str, urls: list[str]) -> list[dict]:
-    results = []
-    for u in urls:
-        u = _strip_tracking(u.strip())
-        if not u:
+    # clean & dedupe
+    seen = set()
+    cleaned = []
+    for a in authors:
+        a = a.strip()
+        if not a:
             continue
-        try:
-            html_text = _fetch_html(u, retries=3, timeout=20)
-            res = _classify_author_match(author_name, u, html_text)
-        except Exception as e:
-            res = {
-                "url": u,
-                "canonical_url": _strip_tracking(u),
-                "domain": urlparse(u).netloc.replace("www.", ""),
-                "decision": "ERROR",
-                "score_ratio": 0.0,
-                "token_coverage": 0.0,
-                "found_candidates": [],
-                "evidence_sources": [],
-                "notes": f"{e}",
-            }
-        results.append(res)
-        time.sleep(0.6)  # be polite
-    return results
+        k = normalize_name(a)
+        if k not in seen:
+            seen.add(k)
+            cleaned.append(a)
 
-# -------------------- UI --------------------
+    title = (soup.title.get_text(strip=True) if soup.title else "").strip()
+    return {"url": u, "title": title, "authors_found": cleaned}
 
-st.title("MLforSEO Tools")
+# -------------------- UI
 
-tab1, tab2 = st.tabs(["🔎 Scrape Experts Grid", "📝 Check Author-Submitted Content"])
+st.set_page_config(page_title=APP_TITLE, page_icon="🔎", layout="wide")
+st.title(APP_TITLE)
 
+tab1, tab2 = st.tabs(["🔎 Scrape Directory", "📝 Check Author-Submitted Content"])
+
+# ---------- TAB 1
 with tab1:
-    st.markdown("Scrape the experts grid from **mlforseo.com/experts** and export results.")
-    with st.sidebar:
-        st.markdown("### Scraper Settings")
-        url_experts = st.text_input("Experts page URL", "https://www.mlforseo.com/experts/")
-        show_images = st.checkbox("Show headshots", value=False, help="Disable for faster tables")
+    st.caption("Scrape any directory page. Use Auto (schema.org Persons), the MLforSEO preset, or supply your own CSS selectors.")
+    url = st.text_input("Directory URL", value=DEFAULT_EXPERTS_URL)
 
-    btn_scrape = st.button("Scrape Experts", type="primary")
-    if btn_scrape:
+    mode = st.radio(
+        "Parsing mode",
+        ["Auto (schema.org Persons)", "Preset: MLforSEO CSS", "Custom CSS selectors"],
+        index=0,
+        horizontal=True,
+    )
+
+    with st.expander("Custom selector profile (only used if mode = Custom CSS selectors)"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            card = st.text_input("Card selector", value="article.expert-card")
+            name = st.text_input("Name selector (text)", value=".title-row .name")
+            name_link = st.text_input("Name link selector (href)", value=".title-row .name a")
+            profile_link = st.text_input("Profile link selector (href)", value="")
+        with c2:
+            website_link = st.text_input("Website link selector (href)", value=".icons a.site")
+            photo_img = st.text_input("Photo <img> selector (src)", value=".photo-wrap img")
+            category_chip = st.text_input("Category chip selector", value=".chips-row .chip")
+            reason = st.text_input("Reason selector (text)", value="p.reason")
+        with c3:
+            resource_link = st.text_input("Resource link selector (href)", value=".resources .resources-list a")
+            resource_label = st.text_input("Resource label selector (inside link)", value=".res-text")
+
+        custom_sel = {
+            "card": card,
+            "name": name,
+            "name_link": name_link,
+            "profile_link": profile_link,
+            "website_link": website_link,
+            "photo_img": photo_img,
+            "category_chip": category_chip,
+            "reason": reason,
+            "resource_link": resource_link,
+            "resource_label": resource_label,
+        }
+
+    show_heads = st.checkbox("Show headshots")
+
+    if st.button("Scrape", type="primary"):
         try:
-            with st.spinner("Scraping experts…"):
-                rows = scrape_mlforseo_experts(url_experts)
-            st.success(f"Found {len(rows)} experts")
+            html, http_info = fetch_html(url)
 
-            def pack_list(xs): 
-                return "; ".join([x for x in xs if x]) if isinstance(xs, list) else ""
-            def pack_domains(rs):
-                return "; ".join(sorted({r.get("domain", "") for r in rs if r.get("domain")}))
+            results, parse_diag = [], {}
+            if mode.startswith("Auto"):
+                results, parse_diag = parse_schema_persons(html)
+                # helpful fallback: if a page doesn't expose schema.org, try the MLforSEO CSS pattern
+                if not results:
+                    fallback, d2 = parse_mlforseo_css(html)
+                    if fallback:
+                        parse_diag = {"auto_persons": 0, "fallback": d2}
+                    results = fallback
+            elif mode.startswith("Preset"):
+                results, parse_diag = parse_mlforseo_css(html)
+            else:
+                results, parse_diag = parse_custom_css(html, custom_sel)
 
-            table_rows = []
-            for r in rows:
-                table_rows.append({
-                    "name": r["name"],
-                    "linkedin": r["linkedin"],
-                    "website": r["website"],
-                    "image": r["image"],
-                    "image_alt": r["image_alt"],
-                    "categories": pack_list(r["categories"]),
-                    "chips": pack_list(r["chips"]),
-                    "reason": r["reason"],
-                    "resources_domains": pack_domains(r["resources"]),
-                    "resources_json": json.dumps(r["resources"], ensure_ascii=False),
-                })
+            st.success(f"Found {len(results)} profile(s)")
+            if results:
+                table_rows = []
+                for x in results:
+                    res_preview = ", ".join(r["label"] for r in x.get("resources", [])[:3])
+                    cats = ", ".join(x.get("categories", []))
+                    table_rows.append(
+                        {
+                            "name": x.get("name",""),
+                            "profile_url": x.get("profile_url",""),
+                            "website": x.get("website",""),
+                            "categories": cats,
+                            "reason": x.get("reason",""),
+                            "resources_preview": res_preview,
+                            "photo": x.get("photo",""),
+                        }
+                    )
 
-            df = pd.DataFrame(table_rows)
-
-            if show_images and not df.empty:
-                st.markdown("#### Headshots")
-                imgs = [i for i in df["image"].tolist() if i]
-                if imgs:
-                    st.image(imgs, width=96)
+                if show_heads:
+                    cols = st.columns(3)
+                    for i, x in enumerate(results):
+                        with cols[i % 3]:
+                            if x.get("photo"):
+                                st.image(x["photo"], use_column_width=True)
+                            st.markdown(f"**{x.get('name','')}**")
+                            if x.get("categories"):
+                                st.caption(", ".join(x["categories"]))
+                            if x.get("website"):
+                                st.write(f"[Website]({x['website']})")
+                            if x.get("profile_url"):
+                                st.write(f"[Profile]({x['profile_url']})")
+                            if x.get("reason"):
+                                st.write(x["reason"])
                 else:
-                    st.info("No images found to display.")
+                    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-            st.markdown("#### Results")
-            st.dataframe(df, use_container_width=True)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Download JSON",
-                    data=json.dumps(rows, indent=2, ensure_ascii=False),
-                    file_name="mlforseo-experts.json",
-                    mime="application/json",
+                json_bytes = json.dumps(results, indent=2).encode("utf-8")
+                csv_bytes = to_csv_bytes(
+                    table_rows,
+                    fieldnames=["name","profile_url","website","categories","reason","resources_preview","photo"]
                 )
-            with c2:
-                st.download_button(
-                    "Download CSV",
-                    data=df.to_csv(index=False),
-                    file_name="mlforseo-experts.csv",
-                    mime="text/csv",
-                )
-
-            with st.expander("Diagnostics (first 2 records)"):
-                st.code(json.dumps(rows[:2], indent=2, ensure_ascii=False))
-
-        except Exception as e:
-            st.error(f"Scrape failed: {e}")
-            st.caption("If the page becomes client-rendered, we can add a Playwright fallback.")
-
-with tab2:
-    st.markdown("Paste an **Author Name** and one or more **Content URLs** to verify authorship.")
-    colA, colB = st.columns([2, 3])
-    with colA:
-        author_input = st.text_input("Author Name", placeholder="e.g., Aimee Jurenka")
-        st.caption("We'll match across JSON-LD, meta tags, visible bylines, and URL hints.")
-    with colB:
-        urls_input = st.text_area(
-            "Content URLs (comma or newline separated)",
-            placeholder="https://...\nhttps://..."
-        )
-
-    # Optional knobs
-    with st.expander("Advanced"):
-        st.caption("These affect only classification thresholds.")
-        ratio_full = st.slider("High fuzzy ratio threshold (MATCH)", 0.70, 0.99, 0.90, 0.01)
-        cov_full = st.slider("Full token coverage threshold (MATCH)", 0.50, 1.00, 1.00, 0.05)
-        ratio_possible = st.slider("Possible fuzzy ratio threshold", 0.50, 0.95, 0.75, 0.01)
-        cov_possible = st.slider("Possible token coverage threshold", 0.25, 0.95, 0.50, 0.05)
-        st.caption("Note: UI thresholds tweak display logic only; internal scores are shown for transparency.")
-
-    # Button
-    btn_check = st.button("Check Authorship", type="primary", use_container_width=True)
-
-    # Run
-    if btn_check:
-        # overwrite thresholds used in classifier by temporarily monkey-patching decision logic
-        old_classify = _classify_author_match
-
-        def patched_classify(target_name: str, url: str, html_text: str) -> dict:
-            res = old_classify(target_name, url, html_text)
-            # Re-map decision using UI thresholds
-            if res["token_coverage"] >= cov_full or res["score_ratio"] >= ratio_full:
-                res["decision"] = "MATCH"
-            elif res["token_coverage"] >= cov_possible or res["score_ratio"] >= ratio_possible:
-                res["decision"] = "POSSIBLE_MATCH"
-            else:
-                res["decision"] = "NO_MATCH"
-            return res
-
-        globals()["_classify_author_match"] = patched_classify
-
-        try:
-            author = author_input.strip()
-            raw_urls = [u.strip() for u in re.split(r"[\n,]", urls_input) if u.strip()]
-            urls = [_strip_tracking(_normalize_url(u, "")) for u in raw_urls]
-
-            if not author:
-                st.warning("Please enter an Author Name.")
-            elif not urls:
-                st.warning("Please enter at least one URL.")
-            else:
-                with st.spinner("Verifying authorship…"):
-                    results = verify_author_for_urls(author, urls)
-
-                # Summary table
-                rows = []
-                for r in results:
-                    rows.append({
-                        "decision": r["decision"],
-                        "url": r["url"],
-                        "canonical_url": r["canonical_url"],
-                        "domain": r["domain"],
-                        "score_ratio": r["score_ratio"],
-                        "token_coverage": r["token_coverage"],
-                        "evidence_sources": "; ".join(sorted(set(r["evidence_sources"]))),
-                        "top_candidate": (r["found_candidates"][0]["candidate"]
-                                          if r["found_candidates"] else ""),
-                    })
-                df = pd.DataFrame(rows)
-                st.markdown("#### Results")
-                st.dataframe(df, use_container_width=True)
-
-                # Download
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.download_button(
-                        "Download JSON",
-                        data=json.dumps(results, indent=2, ensure_ascii=False),
-                        file_name="author_verification_results.json",
-                        mime="application/json",
-                    )
+                    st.download_button("Download JSON", data=json_bytes, file_name="directory.json", mime="application/json")
                 with c2:
-                    st.download_button(
-                        "Download CSV",
-                        data=df.to_csv(index=False),
-                        file_name="author_verification_results.csv",
-                        mime="text/csv",
+                    st.download_button("Download CSV", data=csv_bytes, file_name="directory.csv", mime="text/csv")
+            else:
+                st.info("No profiles parsed. Try another mode or provide custom selectors (see expander).")
+
+            with st.expander("Diagnostics"):
+                st.code(json.dumps({"http": http_info, "parse": parse_diag}, indent=2))
+                st.text_area("First 1200 chars of HTML", (html[:1200] or ""), height=200)
+        except Exception as e:
+            st.error(f"Scrape failed: {e}")
+
+# ---------- TAB 2: Author checker
+with tab2:
+    st.caption("LinkedIn Pulse-aware author verification across multiple URLs.")
+    author_name = st.text_input("Author Name")
+    urls_raw = st.text_area("Content URLs (comma or newline separated)", height=120)
+
+    if st.button("Check Sources", type="secondary"):
+        urls = [u.strip() for u in re.split(r"[\n,]+", urls_raw) if u.strip()]
+        if not urls:
+            st.warning("Please add at least one URL.")
+        else:
+            rows = []
+            for u in urls:
+                try:
+                    art = fetch_article(u)
+                    found = art["authors_found"]
+                    verdict = any(fuzzy_same_author(author_name, a) for a in found)
+                    rows.append(
+                        {
+                            "url": art["url"],
+                            "title": art["title"],
+                            "authors_detected": ", ".join(found) if found else "(none)",
+                            "matches_input_author": "✅ Yes" if verdict else "❌ No",
+                        }
                     )
+                except Exception as e:
+                    rows.append(
+                        {
+                            "url": u,
+                            "title": "(error)",
+                            "authors_detected": f"(error: {e})",
+                            "matches_input_author": "—",
+                        }
+                    )
+            st.dataframe(rows, use_container_width=True, hide_index=True)
 
-                # Details
-                for r in results:
-                    with st.expander(f"Details — {r['url']}"):
-                        st.write(f"**Decision:** {r['decision']}")
-                        st.write(f"**Canonical:** {r['canonical_url']}")
-                        st.write(f"**Domain:** {r['domain']}")
-                        st.write(f"**Fuzzy ratio:** {r['score_ratio']}  |  **Token coverage:** {r['token_coverage']}")
-                        if r["evidence_sources"]:
-                            st.write("**Evidence sources:** " + ", ".join(sorted(set(r["evidence_sources"]))))
-                        if r["found_candidates"]:
-                            st.write("**Candidates:**")
-                            st.dataframe(pd.DataFrame(r["found_candidates"]))
-                        if r["notes"]:
-                            st.info(r["notes"])
-
-        finally:
-            # restore original classifier
-            globals()["_classify_author_match"] = old_classify
-
-# -------------------- Footer --------------------
-st.markdown("---")
-st.caption("Built with requests + BeautifulSoup. If a site becomes fully client-rendered or blocks bots, "
-           "slug heuristics and partial evidence are used; upload HTML or use a headful browser if needed.")
+            json_bytes = json.dumps(rows, indent=2).encode("utf-8")
+            csv_bytes = to_csv_bytes(rows, fieldnames=["url","title","authors_detected","matches_input_author"])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download JSON", data=json_bytes, file_name="author_checks.json", mime="application/json")
+            with c2:
+                st.download_button("Download CSV", data=csv_bytes, file_name="author_checks.csv", mime="text/csv")
