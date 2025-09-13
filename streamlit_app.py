@@ -16,7 +16,7 @@ from urllib.parse import urlparse, unquote
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 import streamlit as st
 
 # ---------- Constants
@@ -26,6 +26,25 @@ DEFAULT_UA = (
 )
 REQ_TIMEOUT = 15
 
+EXCLUDE_CLASS_WORDS = [
+    "related", "similar", "recommended", "more", "trending",
+    "sidebar", "aside", "widget", "promo", "advert", "ads",
+    "newsletter", "subscribe", "footer", "nav", "menu",
+    "breadcrumbs", "comments", "comment", "reply"
+]
+
+PROFILE_PATH_WORDS = [
+    "author", "authors", "profile", "profiles", "about", "team",
+    "people", "staff", "contributors", "contributor", "writer",
+    "writers", "editor", "editors", "member", "bio"
+]
+
+BAD_AUTHOR_NAMES = {
+    "editorial team", "guest author", "guest writer", "staff",
+    "staff writer", "team", "editor", "admins", "administrator",
+    "marketing team", "content team"
+}
+
 # Try to import Playwright lazily (optional).
 PLAYWRIGHT_IMPORTED = False
 try:
@@ -34,20 +53,16 @@ try:
 except Exception:
     PLAYWRIGHT_IMPORTED = False
 
-
 # ---------- Small helpers
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
-
 def safe_text(el) -> str:
     return norm_space(el.get_text(" ", strip=True)) if el else ""
-
 
 def to_ascii_lower(s: str) -> str:
     try:
         import unicodedata
-
         s = unicodedata.normalize("NFKD", s)
         s = "".join(ch for ch in s if not unicodedata.combining(ch))
     except Exception:
@@ -57,14 +72,61 @@ def to_ascii_lower(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 def token_set(name: str) -> List[str]:
     return [t for t in re.split(r"[\s\-_/]+", to_ascii_lower(name)) if t]
 
+def name_match_exactish(declared: str, candidate: str) -> bool:
+    """Require first and last tokens of declared name to be in candidate."""
+    if not declared or not candidate:
+        return False
+    d = [t for t in token_set(declared) if t]
+    c = set(token_set(candidate))
+    if not d:
+        return False
+    if to_ascii_lower(candidate) in BAD_AUTHOR_NAMES:
+        return False
+    if len(d) == 1:
+        return d[0] in c
+    return (d[0] in c) and (d[-1] in c)
 
 def dl_button_bytes(label: str, data: bytes, file_name: str, mime: str):
     st.download_button(label, data=data, file_name=file_name, mime=mime)
 
+def has_excluded_ancestor(el) -> bool:
+    try:
+        for anc in el.parents:
+            cls = " ".join(anc.get("class", [])).lower()
+            idv = (anc.get("id") or "").lower()
+            if any(w in cls or w in idv for w in EXCLUDE_CLASS_WORDS):
+                return True
+    except Exception:
+        pass
+    return False
+
+def pick_main_container(soup: BeautifulSoup):
+    """Try to pick the main article container; fallback to <article>, then <main>, else body."""
+    for sel in [
+        "main article", "article[role='article']", "article.single", "article.post",
+        "main", "div#content", "div.single-post", "div.post", "div.entry", ".entry-content",
+        ".post-content", ".article"
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            return el
+    return soup.body or soup
+
+def get_h1_text(soup: BeautifulSoup) -> str:
+    h1 = soup.find("h1")
+    return safe_text(h1)
+
+def get_canonical_url(soup: BeautifulSoup, page_url: str) -> str:
+    canon = soup.find("link", rel="canonical")
+    if canon and canon.get("href"):
+        return canon.get("href").strip()
+    og = soup.find("meta", property="og:url")
+    if og and og.get("content"):
+        return og.get("content").strip()
+    return page_url
 
 @dataclass
 class HTTPDiag:
@@ -75,20 +137,17 @@ class HTTPDiag:
     length: int
     engine: str
 
-
 @dataclass
 class ParseDiag:
     parser: str
     details: Dict[str, Any]
-
 
 # ---------- Networking
 def fetch_html_requests(url: str, headers: Optional[dict] = None) -> Tuple[str, HTTPDiag]:
     t0 = time.time()
     r = requests.get(
         url,
-        headers=headers
-        or {"User-Agent": DEFAULT_UA, "Accept-Language": "en-US,en;q=0.9"},
+        headers=headers or {"User-Agent": DEFAULT_UA, "Accept-Language": "en-US,en;q=0.9"},
         timeout=REQ_TIMEOUT,
     )
     html = r.text
@@ -102,26 +161,21 @@ def fetch_html_requests(url: str, headers: Optional[dict] = None) -> Tuple[str, 
     )
     return html, diag
 
-
 # --- one-time install helper
 def install_playwright_browsers() -> Tuple[bool, str]:
     if not PLAYWRIGHT_IMPORTED:
         return False, "Playwright not imported"
     import subprocess, sys
-
     try:
         cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        ok = proc.returncode == 0
+        ok = (proc.returncode == 0)
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
         return ok, out
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
-
-def fetch_html_playwright(
-    url: str, wait_selector: Optional[str] = None, timeout_ms: int = 10000
-) -> Tuple[Optional[str], Optional[HTTPDiag], Optional[str]]:
+def fetch_html_playwright(url: str, wait_selector: Optional[str] = None, timeout_ms: int = 10000) -> Tuple[Optional[str], Optional[HTTPDiag], Optional[str]]:
     if not PLAYWRIGHT_IMPORTED:
         return None, None, "playwright_not_available"
 
@@ -132,10 +186,7 @@ def fetch_html_playwright(
             ctx = browser.new_context(user_agent=DEFAULT_UA, locale="en-US")
             page = ctx.new_page()
             resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            selector = (
-                wait_selector
-                or "article.expert-card, .experts-grid article, .experts-grid [data-cats]"
-            )
+            selector = wait_selector or "article.expert-card, .experts-grid article, .experts-grid [data-cats]"
             try:
                 page.wait_for_selector(selector, timeout=timeout_ms)
             except PWTimeoutError:
@@ -159,9 +210,7 @@ def fetch_html_playwright(
         return html, diag, None
     except Exception as e:
         msg = str(e)
-        needs_install = ("Executable doesn't exist" in msg) or (
-            "playwright was just installed" in msg.lower()
-        )
+        needs_install = ("Executable doesn't exist" in msg) or ("playwright was just installed" in msg.lower())
         if needs_install:
             ok, out = install_playwright_browsers()
             if not ok:
@@ -172,7 +221,6 @@ def fetch_html_playwright(
             except Exception as e2:
                 return None, None, f"{type(e2).__name__}: {e2}"
         return None, None, f"{type(e).__name__}: {e}"
-
 
 # ---------- Parsers (Grid + JSON-LD Person)
 def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
@@ -192,9 +240,7 @@ def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
         author_text = safe_text(name_a) if name_a else safe_text(c.select_one("h3.name"))
         profile_url = name_a.get("href") if name_a else None
 
-        site_a = c.select_one(
-            ".icons a.site, .icons .icon-link.site, a.icon-link.site"
-        )
+        site_a = c.select_one(".icons a.site, .icons .icon-link.site, a.icon-link.site")
         website = site_a.get("href") if site_a else None
 
         chips = [safe_text(x) for x in c.select(".chips-row .chip, .chip[data-chip]")]
@@ -216,7 +262,7 @@ def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
         if author_text:
             results.append(
                 {
-                    "author": author_text,  # renamed from "name"
+                    "author": author_text,           # output key is 'author'
                     "profile_url": profile_url,
                     "website": website,
                     "photo": photo,
@@ -232,43 +278,6 @@ def parse_grid_cards(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
     )
     return results, diag
 
-
-def _jsonld_collect_authors(obj, out: List[str]):
-    """Collect author-like names from any JSON-LD shape (Person OR string fields)."""
-    if isinstance(obj, list):
-        for it in obj:
-            _jsonld_collect_authors(it, out)
-    elif isinstance(obj, dict):
-        # Person object
-        t = obj.get("@type")
-        if t == "Person" or (isinstance(t, list) and "Person" in t):
-            nm = obj.get("name")
-            if nm:
-                out.append(str(nm))
-
-        # Article/BlogPosting/etc often embed 'author' or 'creator'
-        for key in ("author", "creator"):
-            if key in obj:
-                val = obj[key]
-                if isinstance(val, str):
-                    out.append(val)
-                elif isinstance(val, dict):
-                    nm = val.get("name") or val.get("@id")
-                    if nm:
-                        out.append(str(nm))
-                elif isinstance(val, list):
-                    for v in val:
-                        if isinstance(v, str):
-                            out.append(v)
-                        elif isinstance(v, dict):
-                            nm = v.get("name") or v.get("@id")
-                            if nm:
-                                out.append(str(nm))
-
-        for v in obj.values():
-            _jsonld_collect_authors(v, out)
-
-
 def parse_schema_person(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
     soup = BeautifulSoup(html, "html.parser")
     people: List[Dict[str, Any]] = []
@@ -281,13 +290,11 @@ def parse_schema_person(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
         except Exception:
             continue
 
-        # Persons (for the grid) – if present we'll surface those as "people".
-        # We keep this simple (used only as a grid fallback).
-        def _collect_persons(obj):
+        def _collect(obj):
             nonlocal people, hits
             if isinstance(obj, list):
                 for it in obj:
-                    _collect_persons(it)
+                    _collect(it)
             elif isinstance(obj, dict):
                 t = obj.get("@type")
                 if t == "Person" or (isinstance(t, list) and "Person" in t):
@@ -301,17 +308,14 @@ def parse_schema_person(html: str) -> Tuple[List[Dict[str, Any]], ParseDiag]:
                     }
                     people.append(person)
                 for v in obj.values():
-                    _collect_persons(v)
+                    _collect(v)
 
-        _collect_persons(data)
+        _collect(data)
 
     diag = ParseDiag("schema_person", {"persons_found": len(people), "jsonld_hits": hits})
     return people, diag
 
-
-def scrape_experts(
-    url: str, prefer_js: bool = True
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
+def scrape_experts(url: str, prefer_js: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
     html, http_req = fetch_html_requests(url)
     grid, d_grid = parse_grid_cards(html)
     if grid:
@@ -319,240 +323,213 @@ def scrape_experts(
 
     persons, d_schema = parse_schema_person(html)
     if persons:
-        return (
-            persons,
-            {"http": asdict(http_req), "parse": {"parser": "schema_person", **d_schema.details}},
-            None,
-        )
+        return persons, {"http": asdict(http_req), "parse": {"parser": "schema_person", **d_schema.details}}, None
 
     if prefer_js:
-        js_html, http_js, js_err = fetch_html_playwright(
-            url, wait_selector="article.expert-card, .experts-grid [data-cats]"
-        )
+        js_html, http_js, js_err = fetch_html_playwright(url, wait_selector="article.expert-card, .experts-grid [data-cats]")
         if js_html and http_js:
             grid2, d_grid2 = parse_grid_cards(js_html)
             if grid2:
                 return grid2, {"http": asdict(http_js), "parse": asdict(d_grid2)}, None
             persons2, d_schema2 = parse_schema_person(js_html)
             if persons2:
-                return (
-                    persons2,
-                    {
-                        "http": asdict(http_js),
-                        "parse": {"parser": "schema_person", **d_schema2.details},
-                    },
-                    None,
-                )
-            return (
-                [],
-                {
-                    "http": asdict(http_js),
-                    "parse": {
-                        "parser": "mlforseo_grid_css",
-                        "cards_found": 0,
-                        "experts_parsed": 0,
-                    },
-                },
-                None,
-            )
+                return persons2, {"http": asdict(http_js), "parse": {"parser": "schema_person", **d_schema2.details}}, None
+            return [], {"http": asdict(http_js), "parse": {"parser": "mlforseo_grid_css", "cards_found": 0, "experts_parsed": 0}}, None
         else:
-            diag = {
-                "http": asdict(http_req),
-                "parse": {
-                    "auto": {
-                        "mlforseo_grid": {
-                            "parser": "mlforseo_grid_css",
-                            "cards_found": 0,
-                            "experts_parsed": 0,
-                        },
-                        "schema_person": {
-                            "parser": "schema_person",
-                            "persons_found": 0,
-                            "jsonld_hits": 0,
-                        },
-                    }
-                },
-            }
+            diag = {"http": asdict(http_req), "parse": {"auto": {
+                "mlforseo_grid": {"parser": "mlforseo_grid_css", "cards_found": 0, "experts_parsed": 0},
+                "schema_person": {"parser": "schema_person", "persons_found": 0, "jsonld_hits": 0}
+            }}}
             if js_err:
                 diag["js_error"] = js_err
             return [], diag, js_err
 
-    return (
-        [],
-        {
-            "http": asdict(http_req),
-            "parse": {"mlforseo_grid_css": {"cards_found": 0, "experts_parsed": 0}},
-        },
-        None,
-    )
+    return [], {
+        "http": asdict(http_req),
+        "parse": {"mlforseo_grid_css": {"cards_found": 0, "experts_parsed": 0}}
+    }, None
 
-
-# ---------- Author signals
-def _page_text_norm(html: str) -> str:
-    """Whole-page text, normalized for easy regexes."""
+# ---------- Author detection helpers
+def collect_author_signals(html: str, page_url: str) -> Dict[str, List[str]]:
+    """Return { 'meta': [...], 'jsonld': [...], 'byline': [...] } unique names."""
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    return to_ascii_lower(text)
+    article = pick_main_container(soup)
+    signals = {"meta": [], "jsonld": [], "byline": []}
+    seen = set()
 
+    def _add(kind: str, name: str):
+        key = (kind, to_ascii_lower(name))
+        if name and key not in seen:
+            signals[kind].append(name)
+            seen.add(key)
 
-def guess_author_from_meta_and_jsonld(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    candidates: List[str] = []
-
-    # Common meta tags
+    # --- meta tags
     for sel in [
         'meta[name="author"]',
-        'meta[property="article:author"]',
+        'meta[property="article:author"]',  # sometimes a URL, but some sites put name here
         'meta[name="byl"]',
         'meta[property="og:author"]',
         'meta[name="parsely-author"]',
-        'meta[name="dc.creator"]',
-        'meta[name="creator"]',
     ]:
         for m in soup.select(sel):
             v = (m.get("content") or "").strip()
-            if v:
-                candidates.append(v)
+            # ignore obvious URLs in article:author
+            if v and not v.lower().startswith("http"):
+                _add("meta", v)
 
-    # itemprop variations (author as name or content)
-    for sel in [
-        "[rel='author']",
-        ".byline a",
-        ".author a",
-        ".author-name",
-        '[itemprop="author"] [itemprop="name"]',
-        '[itemprop="author"]',
-        '[class*="author"]',
-        '[class*="byline"]',
-        '[id*="author"]',
-        '[id*="byline"]',
-    ]:
-        for el in soup.select(sel):
-            t = (el.get("content") or "").strip() if el.has_attr("content") else safe_text(el)
-            if t:
-                candidates.append(t)
+    # --- JSON-LD (filter to current page Article/BlogPosting/VideoObject)
+    canon = get_canonical_url(soup, page_url)
+    h1 = get_h1_text(soup).lower()
 
-    # JSON-LD: Person AND author/creator fields anywhere
-    scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
-    for s in scripts:
+    def _extract_authors_from(obj):
+        names = []
+        if not obj:
+            return names
+        if isinstance(obj, str):
+            return [obj]
+        if isinstance(obj, list):
+            for it in obj:
+                names += _extract_authors_from(it)
+            return names
+        if isinstance(obj, dict):
+            # obj may be Person or Organization
+            nm = obj.get("name")
+            if nm:
+                names.append(str(nm))
+            return names
+        return names
+
+    def _flatten(node, out):
+        if isinstance(node, list):
+            for it in node:
+                _flatten(it, out)
+        elif isinstance(node, dict):
+            out.append(node)
+            for v in node.values():
+                _flatten(v, out)
+
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
         try:
             data = json.loads(s.string or "{}")
         except Exception:
             continue
-        _jsonld_collect_authors(data, candidates)
+        flat: List[dict] = []
+        _flatten(data, flat)
 
-    # Deduplicate
-    seen = set()
-    uniq = []
-    for c in candidates:
-        key = to_ascii_lower(c)
-        if key and key not in seen:
-            seen.add(key)
-            uniq.append(c)
-    return uniq
+        for obj in flat:
+            t = obj.get("@type")
+            if not t:
+                continue
+            if isinstance(t, list):
+                tset = {str(x).lower() for x in t}
+            else:
+                tset = {str(t).lower()}
 
+            if {"article", "blogposting", "newsarticle", "videoobject"} & tset:
+                # try to ensure this JSON-LD is about THIS page
+                obj_url = (obj.get("url") or obj.get("mainEntityOfPage") or "").strip()
+                headline = (obj.get("headline") or obj.get("name") or "").strip().lower()
+                same_page = False
+                if obj_url:
+                    same_page = (to_ascii_lower(obj_url) == to_ascii_lower(canon)) or (to_ascii_lower(obj_url) == to_ascii_lower(page_url))
+                if not same_page and h1 and headline:
+                    same_page = (to_ascii_lower(headline) == to_ascii_lower(h1))
+                if not same_page:
+                    # if the obj has a @id that equals canonical, also accept
+                    oid = (obj.get("@id") or "").strip()
+                    if oid:
+                        same_page = (to_ascii_lower(oid) == to_ascii_lower(canon))
+                if not same_page:
+                    continue
 
-def _build_author_pattern(author: str) -> str:
-    toks = token_set(author)
-    if not toks:
-        return ""
-    # Allow middle initials/extra whitespace between tokens
-    return r"\b" + r"\s+".join([re.escape(t) for t in toks]) + r"\b"
+                # author / creator
+                auth_field = obj.get("author")
+                if not auth_field and "videoobject" in tset:
+                    auth_field = obj.get("creator") or obj.get("uploader")
+                names = _extract_authors_from(auth_field)
+                for nm in names:
+                    _add("jsonld", str(nm))
 
-
-def _find_byline_match(author: str, html: str) -> Tuple[bool, str]:
-    """
-    Look for visible-text bylines like:
-    'By Jane Doe', 'Author: Jane Doe', 'Written by Jane Doe', 'Posted by Jane Doe'
-    Also a fallback: author's full name near top of page (e.g. Loom share page).
-    """
-    norm = _page_text_norm(html)
-    ap = _build_author_pattern(author)
-    if not ap:
-        return False, ""
-
-    # Strong byline phrases
-    strong = rf"(?:^|[\s,;:\-\|])(?:by|author|written by|posted by)\s+{ap}"
-    if re.search(strong, norm):
-        return True, "byline_text"
-
-    # 'Author: Name' after normalization also matches the strong pattern,
-    # but add a couple of extra phrasings just in case.
-    extra = rf"(?:^|[\s,;:\-\|])(?:by:|author:)\s*{ap}"
-    if re.search(extra, norm):
-        return True, "byline_text"
-
-    # Fallback heuristic: name appears within the first ~1500 chars of the page text
-    # (helps for Loom-style "name under title" without the 'By' word).
-    first_1500 = norm[:1500]
-    if re.search(ap, first_1500):
-        return True, "name_near_title"
-
-    return False, ""
-
-
-def _looks_like_profile_or_listing(author: str, url: str, html: str) -> Tuple[bool, str]:
-    """
-    Flag author profile / contributor / listing pages.
-    Signals:
-    - URL path contains /author(s)/, /contributors?/, /about/, /profile/, /team/, /users?/, /people/, /member(s)?/
-    - Title/visible text contains 'articles by <author>', 'posts by <author>', 'author profile', 'about <author>',
-      or generic 'contributor', 'writer profile', 'meet the team', 'our team'
-    """
-    path = (urlparse(url).path or "").lower()
-    url_flags = [
-        "/author/",
-        "/authors/",
-        "/contributor/",
-        "/contributors/",
-        "/writer/",
-        "/writers/",
-        "/about/",
-        "/profile",
-        "/profiles/",
-        "/user/",
-        "/users/",
-        "/member/",
-        "/members/",
-        "/people/",
-        "/team/",
-        "/staff/",
+    # --- visible bylines inside main container (avoid sidebar/related)
+    byline_selectors = [
+        ".byline", ".post-byline", ".entry-meta .author", ".entry-meta",
+        ".meta-author", ".article__byline", ".post-meta", ".post-meta .author",
+        "a[rel='author']", "[itemprop='author'] [itemprop='name']",
+        ".author a", ".author-name", ".posted-by", ".c-article__author"
     ]
-    for f in url_flags:
-        if f in path:
-            return True, f"url_contains_{f.strip('/')}"
+    for sel in byline_selectors:
+        for el in article.select(sel):
+            if has_excluded_ancestor(el):
+                continue
+            t = safe_text(el)
+            if not t:
+                continue
+            # pull explicit "By <name>" or "Author: <name>" if present
+            m = re.search(r"\b(?:by|author|written\s+by)\s*[:\-]?\s*(.+)", t, flags=re.I)
+            cand = m.group(1).strip() if m else t
+            # remove dates/commas if they leak in
+            cand = re.sub(r"\b(on|in)\b.*$", "", cand, flags=re.I).strip()
+            # split if multiple with commas
+            parts = [p.strip() for p in re.split(r"[|•·,/]+", cand) if p.strip()]
+            for p in parts:
+                if len(token_set(p)) >= 1:
+                    _add("byline", p)
 
-    # Text heuristics
-    norm = _page_text_norm(html)
-    ap = _build_author_pattern(author)
-    # Specific patterns: 'articles by NAME', 'posts by NAME', 'about NAME'
-    if ap:
-        patt = rf"(articles|posts)\s+by\s+{ap}"
-        if re.search(patt, norm):
-            return True, "listing_text_articles_or_posts_by_author"
-        if re.search(rf"about\s+{ap}", norm):
-            return True, "about_author_page"
+    # fallback: scan near the H1 container text for "By X"
+    try:
+        h1el = soup.find("h1")
+        container = h1el.parent if h1el else article
+        texts = []
+        for child in container.find_all(text=True, recursive=True):
+            if isinstance(child, NavigableString):
+                txt = norm_space(str(child))
+                if txt and len(txt) <= 200 and not has_excluded_ancestor(child.parent):
+                    texts.append(txt)
+        joined = " • ".join(texts)
+        for m in re.finditer(r"\b(?:by|author|written\s+by)\s*[:\-]?\s*([A-Z][\w\.'\- ]{2,})", joined, flags=re.I):
+            _add("byline", m.group(1).strip())
+    except Exception:
+        pass
 
-    # Generic profile words that usually indicate non-article pages
-    generic_hits = [
-        "author profile",
-        "writer profile",
-        "contributor",
-        "contributors",
-        "our team",
-        "meet the team",
-        "team members",
-        "bio",
-        "profile",
+    # Dedup within lists while preserving order already handled by _add
+    return signals
+
+def is_profile_or_author_landing(html: str, url: str, author: str) -> Optional[str]:
+    """Return reason string if looks like a profile/bio page."""
+    p = urlparse(url)
+    path = (p.path or "").lower()
+    # obvious path hints
+    for seg in path.strip("/").split("/"):
+        if seg in PROFILE_PATH_WORDS:
+            return f"path_contains_{seg}"
+
+    soup = BeautifulSoup(html, "html.parser")
+    body_text = to_ascii_lower(safe_text(soup.body))
+    a_low = to_ascii_lower(author)
+
+    # textual hints
+    patterns = [
+        r"articles by\s+" + re.escape(a_low),
+        r"posts by\s+" + re.escape(a_low),
+        r"author:\s*" + re.escape(a_low),
+        r"about\s+" + re.escape(a_low),
+        r"\b(contributor|contributors|writer|editor|profile)\b"
     ]
-    for kw in generic_hits:
-        if f" {kw} " in f" {norm} ":
-            return True, f"text_contains_{kw.replace(' ', '_')}"
+    for pat in patterns:
+        if re.search(pat, body_text, flags=re.I):
+            return "page_text_profile_signals"
 
-    return False, ""
+    # very few words besides lists? (heuristic: many links, little body)
+    try:
+        words = len(body_text.split())
+        links = len(soup.find_all("a"))
+        if words < 150 and links > 20:
+            return "thin_content_linkhub_profile_like"
+    except Exception:
+        pass
+    return None
 
-
-# ---------- Per-URL verification
+# ---------- Author verification
 def slug_tokens_from_url(url: str) -> List[str]:
     try:
         p = urlparse(url)
@@ -562,7 +539,6 @@ def slug_tokens_from_url(url: str) -> List[str]:
         return toks
     except Exception:
         return []
-
 
 def linkedin_pulse_match(author: str, url: str) -> Tuple[bool, float, str, Optional[str]]:
     a_toks = [t for t in token_set(author) if t]
@@ -582,13 +558,12 @@ def linkedin_pulse_match(author: str, url: str) -> Tuple[bool, float, str, Optio
         return True, 0.7, "linkedin_slug_match", None
     return False, 0.0, "linkedin_slug_no_match", None
 
-
 def verify_authorship(author: str, url: str) -> Dict[str, Any]:
     domain = (urlparse(url).netloc or "").lower()
     norm_author = to_ascii_lower(author)
     author_tokens = token_set(author)
 
-    # Domain-specific: LinkedIn Pulse
+    # Special-case LinkedIn Pulse
     if "linkedin.com" in domain and "/pulse/" in url:
         ok, conf, method, _ = linkedin_pulse_match(author, url)
         result = {
@@ -600,45 +575,22 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "match": bool(ok),
             "note": "Slug-based verification for LinkedIn Pulse",
             "domain": domain,
+            "content_type": "article"
         }
         try:
             html, _ = fetch_html_requests(url)
-            # Flag profile/listing pages (unlikely for Pulse, but cheap to check)
-            prof, reason = _looks_like_profile_or_listing(author, url, html)
-            if prof:
-                result.update(
-                    {
-                        "detected_author": None,
-                        "method": "profile_page",
-                        "confidence": 0.0,
-                        "match": False,
-                        "note": f"Likely profile/listing page ({reason})",
-                    }
-                )
-                return result
-
-            cands = guess_author_from_meta_and_jsonld(html)
-            for cand in cands:
-                if to_ascii_lower(cand) == norm_author:
-                    result["detected_author"] = cand
-                    result["method"] = "meta/jsonld"
-                    result["confidence"] = 0.95
-                    result["match"] = True
-                    result["note"] = "Confirmed via meta/JSON-LD"
-                    return result
-
-            # visible byline fallback
-            found, how = _find_byline_match(author, html)
-            if found:
-                result.update(
-                    {
-                        "detected_author": author,
-                        "method": how,
-                        "confidence": 0.9 if how == "byline_text" else 0.8,
-                        "match": True,
-                        "note": "Found visible byline" if how == "byline_text" else "Found name near title",
-                    }
-                )
+            signals = collect_author_signals(html, url)
+            for source in ("meta", "jsonld", "byline"):
+                for cand in signals[source]:
+                    if name_match_exactish(author, cand):
+                        result.update({
+                            "detected_author": cand,
+                            "method": "meta/jsonld/byline",
+                            "confidence": 0.95 if source in ("meta","jsonld") else 0.9,
+                            "match": True,
+                            "note": f"Confirmed via {source}"
+                        })
+                        return result
         except Exception:
             pass
         return result
@@ -656,11 +608,12 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "match": False,
             "note": f"{type(e).__name__}: {e}",
             "domain": domain,
+            "content_type": "unknown"
         }
 
-    # Profile/listing guardrail
-    prof, reason = _looks_like_profile_or_listing(author, url, html)
-    if prof:
+    # Profile/About detection (treat as NOT a content match even if names align)
+    prof_reason = is_profile_or_author_landing(html, url, author)
+    if prof_reason:
         return {
             "url": url,
             "declared_author": author,
@@ -668,47 +621,36 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "method": "profile_page",
             "confidence": 0.0,
             "match": False,
-            "note": f"Likely profile/listing page ({reason})",
+            "note": f"Looks like a profile/about/contributor page ({prof_reason}).",
             "domain": domain,
+            "content_type": "profile"
         }
 
-    # Meta / JSON-LD
-    cands = guess_author_from_meta_and_jsonld(html)
-    for cand in cands:
-        if to_ascii_lower(cand) == norm_author:
-            return {
-                "url": url,
-                "declared_author": author,
-                "detected_author": cand,
-                "method": "meta/jsonld",
-                "confidence": 0.95,
-                "match": True,
-                "note": "Confirmed via meta/JSON-LD",
-                "domain": domain,
-            }
+    signals = collect_author_signals(html, url)
 
-    # Visible byline (including Loom-style)
-    found, how = _find_byline_match(author, html)
-    if found:
-        return {
-            "url": url,
-            "declared_author": author,
-            "detected_author": author,
-            "method": how,
-            "confidence": 0.9 if how == "byline_text" else 0.8,
-            "match": True,
-            "note": "Found visible byline" if how == "byline_text" else "Found name near title",
-            "domain": domain,
-        }
+    # Priority: meta > jsonld > byline
+    for source, conf_val in (("meta", 0.9), ("jsonld", 0.95), ("byline", 0.9)):
+        for cand in signals[source]:
+            if name_match_exactish(author, cand):
+                return {
+                    "url": url,
+                    "declared_author": author,
+                    "detected_author": cand,
+                    "method": source,
+                    "confidence": conf_val,
+                    "match": True,
+                    "note": f"Matched via {source}",
+                    "domain": domain,
+                    "content_type": "article"
+                }
 
-    # URL slug fallback
+    # Fallback: URL slug match (first/last tokens present)
     path_toks = slug_tokens_from_url(url)
     need = set()
     if author_tokens:
         need.add(author_tokens[0])
         if len(author_tokens) > 1:
             need.add(author_tokens[-1])
-
     if need and need.issubset(set(path_toks)):
         return {
             "url": url,
@@ -717,8 +659,9 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
             "method": "url_slug",
             "confidence": 0.7,
             "match": True,
-            "note": "",
+            "note": "Matched by URL slug tokens",
             "domain": domain,
+            "content_type": "article"
         }
 
     return {
@@ -728,14 +671,12 @@ def verify_authorship(author: str, url: str) -> Dict[str, Any]:
         "method": "not_found",
         "confidence": 0.0,
         "match": False,
-        "note": "No author detected from meta/JSON-LD, byline, or slug",
+        "note": "No author detected from meta/JSON-LD/byline/slug",
         "domain": domain,
+        "content_type": "unknown"
     }
 
-
-def evaluate_authorship_for_resources(
-    author: str, resources: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+def evaluate_authorship_for_resources(author: str, resources: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Evaluate each resource link for authorship; return summary + per-link details."""
     evaluations = []
     authored = 0
@@ -759,9 +700,8 @@ def evaluate_authorship_for_resources(
         "resources_authored": authored,
         "resources_total": total,
         "authorship_rate": rate,
-        "evaluations": evaluations,
+        "evaluations": evaluations
     }
-
 
 # ---------- UI
 st.set_page_config(page_title="MLforSEO Tools", page_icon="🧰", layout="wide")
@@ -778,13 +718,11 @@ with tab1:
     with col_r:
         show_photos = st.checkbox("Show headshots", value=False)
 
-    colx, coly, colz = st.columns([1, 1, 1])
+    colx, coly, colz = st.columns([1,1,1])
     with colx:
         use_js = st.checkbox("Render JavaScript (headless browser)", value=True)
     with coly:
-        st.caption(
-            "Playwright imported: **{}**".format("✅" if PLAYWRIGHT_IMPORTED else "❌")
-        )
+        st.caption("Playwright imported: **{}**".format("✅" if PLAYWRIGHT_IMPORTED else "❌"))
     with colz:
         do_eval = st.checkbox("Evaluate authorship of resource links", value=True)
 
@@ -792,10 +730,7 @@ with tab1:
         if st.button("🔧 One-time setup: install headless Chromium"):
             with st.spinner("Installing Playwright browser (chromium)…"):
                 ok, out = install_playwright_browsers()
-            st.toast(
-                "Playwright browser installed." if ok else "Playwright install failed.",
-                icon="✅" if ok else "❌",
-            )
+            st.toast("Playwright browser installed." if ok else "Playwright install failed.", icon="✅" if ok else "❌")
             st.expander("Install output").code(out)
 
     if st.button("Scrape Experts", type="primary"):
@@ -824,43 +759,38 @@ with tab1:
 
                 # flatten per-resource evaluation rows for separate table/export
                 for ev in eval_pack["evaluations"]:
-                    per_resource_rows.append(
-                        {
-                            "author": author,
-                            "url": ev.get("url"),
-                            "domain": ev.get("domain"),
-                            "label": ev.get("label"),
-                            "method": ev.get("method"),
-                            "confidence": ev.get("confidence"),
-                            "match": ev.get("match"),
-                            "detected_author": ev.get("detected_author"),
-                            "note": ev.get("note"),
-                        }
-                    )
+                    per_resource_rows.append({
+                        "author": author,
+                        "url": ev.get("url"),
+                        "domain": ev.get("domain"),
+                        "label": ev.get("label"),
+                        "method": ev.get("method"),
+                        "confidence": ev.get("confidence"),
+                        "match": ev.get("match"),
+                        "detected_author": ev.get("detected_author"),
+                        "content_type": ev.get("content_type"),
+                        "note": ev.get("note"),
+                    })
                 if total_experts:
-                    prog.progress((i + 1) / total_experts)
+                    prog.progress((i+1)/total_experts)
             prog.empty()
 
         if data:
             # Build the main experts table
             flat_rows = []
             for item in data:
-                flat_rows.append(
-                    {
-                        "author": item.get("author"),
-                        "profile_url": item.get("profile_url"),
-                        "website": item.get("website"),
-                        "photo": item.get("photo"),
-                        "categories": ", ".join(item.get("categories") or []),
-                        "reason": item.get("reason"),
-                        "resources": ", ".join(
-                            [r.get("href") for r in item.get("resources", [])]
-                        ),
-                        "resources_authored": item.get("resources_authored", None),
-                        "resources_total": item.get("resources_total", None),
-                        "authorship_rate": item.get("authorship_rate", None),
-                    }
-                )
+                flat_rows.append({
+                    "author": item.get("author"),
+                    "profile_url": item.get("profile_url"),
+                    "website": item.get("website"),
+                    "photo": item.get("photo"),
+                    "categories": ", ".join(item.get("categories") or []),
+                    "reason": item.get("reason"),
+                    "resources": ", ".join([r.get("href") for r in item.get("resources", [])]),
+                    "resources_authored": item.get("resources_authored", None),
+                    "resources_total": item.get("resources_total", None),
+                    "authorship_rate": item.get("authorship_rate", None),
+                })
             df = pd.DataFrame(flat_rows)
 
             if show_photos and "photo" in df.columns:
@@ -873,42 +803,25 @@ with tab1:
 
             # Downloads for experts
             jbytes = json.dumps(data, indent=2).encode("utf-8")
-            dl_button_bytes(
-                "Download Experts JSON", jbytes, "experts.json", "application/json"
-            )
-            dl_button_bytes(
-                "Download Experts CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                "experts.csv",
-                "text/csv",
-            )
+            dl_button_bytes("Download Experts JSON", jbytes, "experts.json", "application/json")
+            dl_button_bytes("Download Experts CSV", df.to_csv(index=False).encode("utf-8"), "experts.csv", "text/csv")
 
             # Per-resource evaluations table/export (if any)
             if per_resource_rows:
                 st.markdown("**Per-resource authorship checks**")
                 df_ev = pd.DataFrame(per_resource_rows)
                 st.dataframe(df_ev, use_container_width=True)
-                dl_button_bytes(
-                    "Download Resource Checks JSON",
-                    json.dumps(per_resource_rows, indent=2).encode("utf-8"),
-                    "resource_checks.json",
-                    "application/json",
-                )
-                dl_button_bytes(
-                    "Download Resource Checks CSV",
-                    df_ev.to_csv(index=False).encode("utf-8"),
-                    "resource_checks.csv",
-                    "text/csv",
-                )
+                dl_button_bytes("Download Resource Checks JSON", json.dumps(per_resource_rows, indent=2).encode("utf-8"),
+                                "resource_checks.json", "application/json")
+                dl_button_bytes("Download Resource Checks CSV", df_ev.to_csv(index=False).encode("utf-8"),
+                                "resource_checks.csv", "text/csv")
 
         with st.expander("Diagnostics"):
             st.code(json.dumps(diag, indent=2))
             if js_err and use_js:
                 st.warning(f"JS rendering error: {js_err}")
                 if "playwright_install_failed" in js_err or "not_available" in js_err:
-                    st.info(
-                        "Click the **🔧 One-time setup** button above, then try again."
-                    )
+                    st.info("Click the **🔧 One-time setup** button above, then try again.")
 
 with tab2:
     st.subheader("Verify an author name against one or more URLs.")
@@ -919,26 +832,17 @@ with tab2:
     with u_col:
         urls_raw = st.text_area(
             "Content URLs (comma-separated)",
-            value="https://www.linkedin.com/pulse/buzzword-betty-vol-1-vector-embeddings-cosine-semantic-jurenka-8iqwc/?trackingId=7pahQErMQzmJThdkY8KSsw%3D%3D, https://www.linkedin.com/pulse/buzzword-betty-vol-6-agentic-agents-mcps-aimee-jurenka-oekoc/?trackingId=rDFpw%2F2tQCa%2BYxTdLJxo3Q%3D%3D",
+            value="https://www.linkedin.com/pulse/buzzword-betty-vol-1-vector-embeddings-cosine-semantic-jurenka-8iqwc/?trackingId=7pahQErMQzmJThdkY8KSsw%3D%3D, https://www.linkedin.com/pulse/buzzword-betty-vol-6-agentic-agents-mcps-aimee-jurenka-oekoc/?trackingId=rDFpw%2F2tQCa%2BYxTdLJxo3Q%3D%3D"
         )
 
     if st.button("Run Checks", type="primary"):
         urls = [u.strip() for u in urls_raw.split(",") if u.strip()]
         rows = [verify_authorship(author_name, u) for u in urls]
 
-        df = pd.DataFrame(
-            rows,
-            columns=[
-                "url",
-                "declared_author",
-                "detected_author",
-                "method",
-                "confidence",
-                "match",
-                "note",
-                "domain",
-            ],
-        )
+        df = pd.DataFrame(rows, columns=[
+            "url","declared_author","detected_author","method",
+            "confidence","match","note","domain","content_type"
+        ])
         st.dataframe(df, use_container_width=True)
 
         ok = sum(1 for r in rows if r.get("match"))
@@ -948,12 +852,5 @@ with tab2:
             st.error("No matches found.")
 
         jbytes = json.dumps(rows, indent=2).encode("utf-8")
-        dl_button_bytes(
-            "Download JSON", jbytes, "author_checks.json", "application/json"
-        )
-        dl_button_bytes(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "author_checks.csv",
-            "text/csv",
-        )
+        dl_button_bytes("Download JSON", jbytes, "author_checks.json", "application/json")
+        dl_button_bytes("Download CSV", df.to_csv(index=False).encode("utf-8"), "author_checks.csv", "text/csv")
