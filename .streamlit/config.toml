@@ -1,0 +1,7 @@
+[server]
+fileWatcherType = "none"   # avoids the inotify limit issue
+runOnSave = false
+
+# Optional niceties:
+[client]
+toolbarMode = "minimal"
