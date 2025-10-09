@@ -1,5 +1,8 @@
 # streamlit_app.py
-# Generic Directory Scraper + Authorship Verifier (explicit "cause", About-page filter)
+# Generic Directory Scraper → Authorship Verifier
+# - Scrapes directory cards for (author, submitted links)
+# - Verifies each link via JSON-LD/meta/byline signals
+# - Explains a human-readable "Cause" (and excludes About/profile pages)
 # Run: streamlit run streamlit_app.py
 
 import re
@@ -32,7 +35,6 @@ try:
     HAVE_PW = True
 except Exception:
     HAVE_PW = False
-
 
 APP_NAME = "Directory → Authorship Verifier"
 
@@ -402,6 +404,24 @@ def person_like(name: str) -> bool:
     caps = sum(1 for p in parts if re.match(r"^[A-Z][a-z'’.-]+$", p))
     return caps >= max(2, len(parts)-1)
 
+def dedupe_links(links: List[Dict]) -> List[Dict]:
+    seen = set(); out = []
+    for l in links:
+        u = urldefrag(l["url"])[0]
+        if u not in seen:
+            seen.add(u); out.append(l)
+    return out
+
+def nearest_card(node):
+    # climb up to a few ancestors looking for a container with a heading + some links
+    cur = node
+    for _ in range(6):
+        if not cur: break
+        if (cur.find(["h1","h2","h3","h4"]) is not None) and cur.find("a", href=True):
+            return cur
+        cur = cur.parent
+    return None
+
 def scrape_with_playwright(url: str, mode: str, cfg: Dict) -> List[Dict]:
     """Return [{'author': 'Name', 'links': [{'url':..., 'anchor':...}, ...]}]."""
     results = []
@@ -414,33 +434,39 @@ def scrape_with_playwright(url: str, mode: str, cfg: Dict) -> List[Dict]:
         page.goto(url, wait_until="networkidle", timeout=60000)
 
         if mode == "CSS selectors":
-            card_sel = cfg.get("card_sel", "")
-            name_sel = cfg.get("name_sel", "")
-            links_sel = cfg.get("links_sel", "")
+            params = {
+                "cardSel": cfg.get("card_sel", ""),
+                "nameSel": cfg.get("name_sel", ""),
+                "linksSel": cfg.get("links_sel", ""),
+            }
             data = page.evaluate("""
-            (cardSel, nameSel, linksSel) => {
+            (params) => {
+              const { cardSel, nameSel, linksSel } = params;
               const OUT = [];
               const cards = document.querySelectorAll(cardSel || "section, article, div");
               cards.forEach(card => {
                 const nameEl = nameSel ? card.querySelector(nameSel) : card.querySelector("h1, h2, h3, h4");
                 const name = (nameEl && nameEl.innerText || "").trim();
                 const links = [];
-                (linksSel ? card.querySelectorAll(linksSel) : card.querySelectorAll("a")).forEach(a => {
+                (linksSel ? card.querySelectorAll(linksSel) : card.querySelectorAll("a[href]")).forEach(a => {
                   const href = a.getAttribute("href");
                   if (!href) return;
-                  links.push({url: a.href || href, anchor: (a.innerText || "").trim()});
+                  links.push({ url: a.href || href, anchor: (a.innerText || "").trim() });
                 });
-                OUT.push({name, links});
+                OUT.push({ name, links });
               });
               return OUT;
             }
-            """, card_sel, name_sel, links_sel)
+            """, params)
 
         elif mode == "Marker text":
-            marker_re = cfg.get("marker_re", "")
-            container_sel = cfg.get("container_sel", "section, article, div")
+            params = {
+                "markerRe": cfg.get("marker_re", "start\\s+exploring"),
+                "containerSel": cfg.get("container_sel", "section, article, div"),
+            }
             data = page.evaluate("""
-            (markerRe, containerSel) => {
+            (params) => {
+              const { markerRe, containerSel } = params;
               const OUT = [];
               const re = new RegExp(markerRe, 'i');
               const els = Array.from(document.querySelectorAll('*')).filter(el => re.test(el.textContent || ''));
@@ -450,20 +476,17 @@ def scrape_with_playwright(url: str, mode: str, cfg: Dict) -> List[Dict]:
                 const h = card.querySelector("h1, h2, h3, h4");
                 const name = (h && h.innerText || '').trim();
                 const links = [];
-                const as = card.querySelectorAll('a[href]');
-                let passed = false;
+                const as = Array.from(card.querySelectorAll('a[href]'));
                 for (const a of as) {
-                  if (!passed && marker.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) {
-                    passed = true;
+                  if (marker.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                    links.push({ url: a.href, anchor: (a.innerText || '').trim() });
                   }
-                  if (!passed) continue;
-                  links.push({url: a.href, anchor: (a.innerText || '').trim()});
                 }
-                OUT.push({name, links});
+                OUT.push({ name, links });
               }
               return OUT;
             }
-            """, marker_re or "start\\s+exploring", container_sel)
+            """, params)
 
         else:  # Heuristic
             data = page.evaluate("""
@@ -475,9 +498,9 @@ def scrape_with_playwright(url: str, mode: str, cfg: Dict) -> List[Dict]:
                 const name = (h && h.innerText || '').trim();
                 const links = [];
                 card.querySelectorAll("a[href]").forEach(a => {
-                  links.push({url: a.href, anchor: (a.innerText || '').trim()});
+                  links.push({ url: a.href, anchor: (a.innerText || '').trim() });
                 });
-                OUT.push({name, links});
+                OUT.push({ name, links });
               });
               return OUT;
             }
@@ -486,14 +509,12 @@ def scrape_with_playwright(url: str, mode: str, cfg: Dict) -> List[Dict]:
         browser.close()
 
     # Post-filter & clean
-    base = url
     out = []
-    for block in data:
+    for block in data or []:
         name = norm(block.get("name"))
         if not person_like(name):
             continue
-        links = []
-        seen = set()
+        seen, links = set(), []
         for l in block.get("links") or []:
             href = norm(l.get("url"))
             if not href or href in seen:
@@ -514,7 +535,7 @@ def scrape_with_bs4(url: str, mode: str, cfg: Dict) -> List[Dict]:
     if mode == "CSS selectors":
         card_sel = cfg.get("card_sel") or "section, article, div"
         name_sel = cfg.get("name_sel") or "h1, h2, h3, h4"
-        links_sel = cfg.get("links_sel") or "a"
+        links_sel = cfg.get("links_sel") or "a[href]"
 
         for card in soup.select(card_sel):
             name_el = card.select_one(name_sel)
@@ -544,12 +565,15 @@ def scrape_with_bs4(url: str, mode: str, cfg: Dict) -> List[Dict]:
             name = h.get_text(" ", strip=True) if h else ""
             if not person_like(name):
                 continue
-            # links after marker inside card
+            # links after marker inside card (best-effort using sourceline if present)
             links = []
             for a in card.find_all("a", href=True):
-                # only anchors that appear after marker in the document order
-                if a.sourceline and marker.sourceline and a.sourceline < marker.sourceline:
-                    continue
+                try:
+                    if hasattr(a, "sourceline") and hasattr(marker, "sourceline"):
+                        if a.sourceline is not None and marker.sourceline is not None and a.sourceline < marker.sourceline:
+                            continue
+                except Exception:
+                    pass
                 links.append({"url": urljoin(final, a["href"].strip()), "anchor": a.get_text(" ", strip=True)})
             links = dedupe_links(links)
             if links:
@@ -570,25 +594,6 @@ def scrape_with_bs4(url: str, mode: str, cfg: Dict) -> List[Dict]:
             out.append({"author": name, "links": links})
     return out
 
-def nearest_card(node):
-    # climb up to 6 ancestors looking for a container with a heading + some links
-    cur = node
-    for _ in range(6):
-        if not cur: break
-        headings = cur.find_all(["h1","h2","h3","h4"])
-        if headings and cur.find("a", href=True):
-            return cur
-        cur = cur.parent
-    return None
-
-def dedupe_links(links: List[Dict]) -> List[Dict]:
-    seen = set(); out = []
-    for l in links:
-        u = urldefrag(l["url"])[0]
-        if u not in seen:
-            seen.add(u); out.append(l)
-    return out
-
 def scrape_directory(url: str, mode: str, cfg: Dict, prefer_playwright: bool) -> List[Dict]:
     if prefer_playwright and HAVE_PW:
         data = scrape_with_playwright(url, mode, cfg)
@@ -603,12 +608,12 @@ st.title(APP_NAME)
 with st.sidebar:
     st.subheader("Verification settings")
     use_js = st.checkbox("Enable JS rendering for verification (requests-html)", value=False)
-    st.caption("Used only during authorship checks on target URLs.")
+    st.caption("Used only when fetching target article URLs.")
     st.subheader("Scraper settings")
     prefer_pw = st.checkbox("Prefer Playwright for scraping", value=True)
     same_site_only = st.checkbox("Keep only same-site links", value=False)
-    include_pat = st.text_input("Include REGEX (href filter)", value=r"", help="Optional; applied to link URLs.")
-    exclude_pat = st.text_input("Exclude REGEX (href filter)", value=r"", help="Optional; applied to link URLs.")
+    include_pat = st.text_input("Include REGEX (href filter)", value=r"")
+    exclude_pat = st.text_input("Exclude REGEX (href filter)", value=r"")
     max_links_per_author = st.number_input("Max links per author", min_value=1, max_value=50, value=12)
 
 st.subheader("1) Directory URLs (one per line)")
