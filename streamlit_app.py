@@ -693,36 +693,35 @@ if st.button("Verify now", type="primary"):
         st.warning("Nothing scraped yet.")
     else:
         total = sum(len(g["links"]) for g in groups) or 1
-        done = 0
-        prog = st.progress(0.0)
         rows = []
+
+        prog = st.progress(0.0)          # progress bar only
+        status_txt = st.empty()           # small status line
+        done = 0
+        t0 = time.time()
 
         for g in groups:
             author = g["author"]
-            st.markdown(f"### {author}")
             for l in g["links"]:
                 url = l["url"]
+                status_txt.write(f"Processing {done+1}/{total}…")
                 res = verify_authorship(author, url, use_js=use_js)
-                done += 1; prog.progress(done/total)
-                st.markdown(f"**{res.get('label','—')}** · {res.get('score_str','0.00')}  \n[{res.get('final_url') or res.get('url')}]({res.get('final_url') or res.get('url')})")
-                st.write(f"**Cause:** {res.get('cause','')}")
-                best = res.get("best_signal")
-                if best:
-                    st.caption(f"Best signal: `{best.get('source')}` → {best.get('value')}")
-                with st.expander("Signals"):
-                    st.json(res.get("signals", []))
-                st.divider()
+                best = res.get("best_signal") or {}
+
                 rows.append({
                     "Author": author,
                     "URL": res.get("final_url") or res.get("url"),
                     "Status": res.get("label"),
                     "Score": res.get("score_str"),
                     "Cause": res.get("cause",""),
-                    "Best Signal": (best or {}).get("source") if best else "",
-                    "Best Value": (best or {}).get("value") if best else "",
+                    "Best Signal": best.get("source",""),
+                    "Best Value": best.get("value",""),
                 })
 
-        # persist results so the table survives reruns
+                done += 1
+                prog.progress(done / total)
+
+        status_txt.write(f"Done {done} URLs in {time.time()-t0:.1f}s")
         st.session_state["_rows"] = rows
 
 # ---------- Persistent summary (always visible) ----------
