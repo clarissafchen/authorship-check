@@ -5,6 +5,8 @@
 # - Explains a human-readable "Cause" (and excludes About/profile pages)
 # Run: streamlit run streamlit_app.py
 
+import pandas as pd
+import io
 import re
 import json
 import time
@@ -717,9 +719,48 @@ if st.button("Verify now", type="primary"):
                 })
 
         st.subheader("Summary table")
-        if rows:
-            st.dataframe(rows, use_container_width=True)
-            st.download_button("Download results.json",
-                               data=json.dumps(rows, indent=2).encode("utf-8"),
-                               file_name="directory_authorship_results.json",
-                               mime="application/json")
+if rows:
+    # Full results table
+    df = pd.DataFrame(
+        rows,
+        columns=["Author", "URL", "Status", "Score", "Cause", "Best Signal", "Best Value"]
+    )
+    st.dataframe(df, use_container_width=True)
+
+    # Per-author rollup
+    st.subheader("Per-author rollup")
+    rollup = (
+        df.assign(Count=1)
+          .pivot_table(index="Author", columns="Status", values="Count", aggfunc="sum", fill_value=0)
+          .reset_index()
+    )
+    st.dataframe(rollup, use_container_width=True)
+
+    # Downloads: JSON + CSV (+ Excel if xlsxwriter is available)
+    st.download_button(
+        "Download results.json",
+        data=json.dumps(rows, indent=2).encode("utf-8"),
+        file_name="directory_authorship_results.json",
+        mime="application/json",
+    )
+
+    st.download_button(
+        "Download results.csv",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="directory_authorship_results.csv",
+        mime="text/csv",
+    )
+
+    try:
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Results", index=False)
+            rollup.to_excel(writer, sheet_name="Rollup", index=False)
+        st.download_button(
+            "Download results.xlsx",
+            data=xlsx_buf.getvalue(),
+            file_name="directory_authorship_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception:
+        st.caption("Tip: install `xlsxwriter` to enable Excel export (pip install xlsxwriter).")
