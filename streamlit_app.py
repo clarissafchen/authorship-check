@@ -1,12 +1,8 @@
-# streamlit_app.py
-# Generic Directory Scraper → Authorship Verifier
+# Directory Scraper → Authorship Verifier
 # - Scrapes directory cards for (author, submitted links)
 # - Verifies each link via JSON-LD/meta/byline signals
 # - Explains a human-readable "Cause" (and excludes About/profile pages)
-# Run: streamlit run streamlit_app.py
 
-import pandas as pd
-import io
 import re
 import json
 import time
@@ -18,6 +14,8 @@ from urllib.parse import urlparse, urljoin, urldefrag
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
+import pandas as pd
+import io
 
 # ---------- Optional deps ----------
 try:
@@ -607,6 +605,12 @@ def scrape_directory(url: str, mode: str, cfg: Dict, prefer_playwright: bool) ->
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
 
+# session state for persistent results table
+if "_rows" not in st.session_state:
+    st.session_state["_rows"] = []
+if "_scraped_groups" not in st.session_state:
+    st.session_state["_scraped_groups"] = []
+
 with st.sidebar:
     st.subheader("Verification settings")
     use_js = st.checkbox("Enable JS rendering for verification (requests-html)", value=False)
@@ -718,16 +722,19 @@ if st.button("Verify now", type="primary"):
                     "Best Value": (best or {}).get("value") if best else "",
                 })
 
-        st.subheader("Summary table")
+        # persist results so the table survives reruns
+        st.session_state["_rows"] = rows
+
+# ---------- Persistent summary (always visible) ----------
+st.subheader("Summary table")
+rows = st.session_state.get("_rows", [])
 if rows:
-    # Full results table
     df = pd.DataFrame(
         rows,
         columns=["Author", "URL", "Status", "Score", "Cause", "Best Signal", "Best Value"]
     )
     st.dataframe(df, use_container_width=True)
 
-    # Per-author rollup
     st.subheader("Per-author rollup")
     rollup = (
         df.assign(Count=1)
@@ -736,21 +743,19 @@ if rows:
     )
     st.dataframe(rollup, use_container_width=True)
 
-    # Downloads: JSON + CSV (+ Excel if xlsxwriter is available)
+    # Downloads: JSON + CSV + Excel (if xlsxwriter available)
     st.download_button(
         "Download results.json",
         data=json.dumps(rows, indent=2).encode("utf-8"),
         file_name="directory_authorship_results.json",
         mime="application/json",
     )
-
     st.download_button(
         "Download results.csv",
         data=df.to_csv(index=False).encode("utf-8"),
         file_name="directory_authorship_results.csv",
         mime="text/csv",
     )
-
     try:
         xlsx_buf = io.BytesIO()
         with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
@@ -764,3 +769,5 @@ if rows:
         )
     except Exception:
         st.caption("Tip: install `xlsxwriter` to enable Excel export (pip install xlsxwriter).")
+else:
+    st.caption("Run verification to populate results.")
