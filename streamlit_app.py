@@ -623,7 +623,7 @@ with st.sidebar:
     max_links_per_author = st.number_input("Max links per author", min_value=1, max_value=50, value=12)
 
 st.subheader("1) Directory URLs (one per line)")
-dirs_text = st.text_area("Paste listing pages", placeholder="https://www.mlforseo.com/experts/\nhttps://example.com/directory", height=100)
+dirs_text = st.text_area("Paste listing pages", placeholder="https://example.com/directory", height=100)
 
 st.subheader("2) Scraping mode")
 mode = st.radio("Choose one", ["CSS selectors", "Marker text", "Heuristic"], horizontal=True)
