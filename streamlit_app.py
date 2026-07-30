@@ -1,4 +1,4 @@
-# Directory Scraper → Authorship Verifier
+# Authorship Verifier
 # - Scrapes directory cards for (author, submitted links)
 # - Verifies each link via JSON-LD/meta/byline signals
 # - Explains a human-readable "Cause" (and excludes About/profile pages)
